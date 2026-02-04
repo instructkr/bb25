@@ -74,6 +74,10 @@ print(all(r.passed for r in results))
 
 See `docs/sample_usage.py` for an end-to-end example using BM25, Bayesian calibration, and hybrid fusion.
 
+## Benchmarks (BM25 vs Bayesian)
+
+See `benchmarks/README.md` for a lightweight runner that compares BM25 and Bayesian BM25 on your own corpora.
+
 ## Build from source (Rust)
 
 ```
