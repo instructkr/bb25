@@ -14,6 +14,44 @@ cargo run --manifest-path bayesian_bm25_rs/Cargo.toml
 
 Expected output: 10 experiments with PASS/FAIL and supporting details. All should pass.
 
+For Python, the extension module name is `bayesian_bm25` (distribution name `bayesian_bm25_rs`).
+
+### Python (PyO3)
+
+Build and install locally with maturin:
+
+```
+cd bayesian_bm25_rs
+python -m pip install maturin
+maturin develop
+```
+
+Smoke test:
+
+```
+python -c "import bayesian_bm25 as bb; print(len(bb.run_experiments()))"
+```
+
+If your Python version is newer than the PyO3 version supports, set:
+
+```
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+```
+
+### Pyodide / WASM (outline)
+
+This project is designed to support a Pyodide build, but the exact build steps depend on your Pyodide toolchain and target environment. The binding layer avoids file I/O and uses only basic Python types, which keeps the API Pyodide-friendly.
+
+If you are using `pyodide-build`, the typical flow is:
+
+1) Install the Pyodide build toolchain.
+2) Build the package from `pyproject.toml`.
+3) Load the resulting wheel in your Pyodide runtime.
+
+If you prefer a direct Rust build, ensure a WASM toolchain is installed and then build a wheel for the `wasm32-unknown-emscripten` target using maturin.
+
+See `docs/pyodide.md` and `scripts/build_pyodide.sh` for a minimal scaffold.
+
 ## Scope and Validation Goals
 
 The experiments are designed to check the core claims of the Bayesian BM25 formulation:

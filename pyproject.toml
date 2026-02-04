@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "bayesian_bm25_rs"
+version = "0.1.0"
+description = "Rust implementation of Bayesian BM25 experimental validation"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "bayesian_bm25"
+features = ["python"]

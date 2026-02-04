@@ -9,6 +9,7 @@ use crate::math_utils::{safe_log, sigmoid, EPSILON};
 use crate::parameter_learner::ParameterLearner;
 use crate::vector_scorer::VectorScorer;
 
+#[derive(Clone)]
 pub struct Query {
     pub text: String,
     pub terms: Vec<String>,

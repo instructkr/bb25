@@ -1,0 +1,21 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+
+# Packaging
+/dist/
+/build/
+*.egg-info/
+
+# Virtualenv
+/.venv/
+/venv/
+
+# OS
+.DS_Store

@@ -6,7 +6,14 @@ edition = "2021"
 [lib]
 name = "bayesian_bm25"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "run_experiments"
 path = "src/main.rs"
+
+[dependencies]
+pyo3 = { version = "0.21", optional = true, features = ["extension-module"] }
+
+[features]
+python = ["pyo3"]

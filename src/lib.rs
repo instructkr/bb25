@@ -7,6 +7,10 @@ pub mod vector_scorer;
 pub mod hybrid_scorer;
 pub mod parameter_learner;
 pub mod experiments;
+pub mod defaults;
+
+#[cfg(feature = "python")]
+mod pybindings;
 
 pub use math_utils::{
     clamp,
@@ -27,3 +31,4 @@ pub use vector_scorer::VectorScorer;
 pub use hybrid_scorer::HybridScorer;
 pub use parameter_learner::{ParameterLearner, ParameterLearnerResult};
 pub use experiments::{ExperimentRunner, Query};
+pub use defaults::{build_default_corpus, build_default_queries};
