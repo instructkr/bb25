@@ -2,6 +2,10 @@
 name = "bayesian_bm25"
 version = "0.1.0"
 edition = "2021"
+description = "Bayesian BM25 scoring and experimental validation (Rust core + Python bindings)"
+readme = "README.md"
+license = "UNLICENSED"
+repository = "https://github.com/sigridjineth/bayesian_bm25_rs"
 
 [lib]
 name = "bayesian_bm25"

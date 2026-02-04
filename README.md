@@ -1,222 +1,109 @@
-# Bayesian BM25 Experimental Validation (Rust)
+# Bayesian BM25 (Rust + Python)
 
-This repository is a Rust port of the Python experimental validation for the Bayesian BM25 paper. It re-implements the same corpus, queries, scorers, and experiments, and is intended to reproduce the same numerical properties and PASS/FAIL outcomes. The implementation is self-contained and uses only the Rust standard library.
+Use this package to score text with BM25, convert scores into calibrated probabilities (Bayesian BM25), and fuse lexical + vector signals with proper probabilistic AND/OR. It also ships a reproducible experiment suite so you can verify the expected numerical properties.
 
-## Abstract
+- PyPI package: `bayesian_bm25_rs`
+- Import name: `bayesian_bm25`
 
-Hybrid search typically combines lexical signals (e.g., BM25) with vector similarity using heuristics such as weighted sums or Reciprocal Rank Fusion, which either require tuning or discard score magnitudes. The Bayesian BM25 formulation converts raw BM25 scores into calibrated probabilities via Bayes' theorem using a sigmoid likelihood and informative priors. Once both lexical and vector signals are valid probabilities, they can be combined using standard probability theory (AND = joint; OR = union), yielding bounded, interpretable outputs without ad-hoc scaling. This port validates the theory via ten numerical experiments that test formula equivalence, calibration, monotonicity, bounds, and optimization behavior.
-
-## Quick Start
-
-```
-cargo run --manifest-path bayesian_bm25_rs/Cargo.toml
-```
-
-Expected output: 10 experiments with PASS/FAIL and supporting details. All should pass.
-
-For Python, the extension module name is `bayesian_bm25` (distribution name `bayesian_bm25_rs`).
-
-### Python (PyO3, native)
-
-Build and install locally with maturin:
+## Install (Python)
 
 ```
-cd bayesian_bm25_rs
-python -m pip install maturin
-maturin develop
+pip install bayesian_bm25_rs
 ```
 
-Smoke test:
+## Quick Usage (Python)
+
+### 1) Default corpus + queries
 
 ```
-python - <<'PY'
 import bayesian_bm25 as bb
+
 corpus = bb.build_default_corpus()
 docs = corpus.documents()
 queries = bb.build_default_queries()
-scorer = bb.BM25Scorer(corpus, 1.2, 0.75)
-score = scorer.score(queries[0].terms, docs[0])
-print("docs", len(docs))
-print("query", queries[0].text)
+
+bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+score = bm25.score(queries[0].terms, docs[0])
 print("score0", score)
-PY
 ```
 
-If your Python version is newer than the PyO3 version supports, set:
+### 2) Your own corpus
 
 ```
-PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
-```
-
-### Pyodide / WASM (tested)
-
-This project supports Pyodide builds. The binding layer avoids file I/O and uses only basic Python types, which keeps the API Pyodide-friendly.
-
-The following sequence was tested locally on macOS:
-
-1) Install pyodide-build and the cross-build env:
-
-```
-python -m pip install pyodide-build
-pyodide xbuildenv install
-pyodide xbuildenv install-emscripten
-```
-
-2) Ensure the Pyodide Rust toolchain is available:
-
-```
-rustup toolchain install nightly-2025-02-01
-rustup target add wasm32-unknown-emscripten --toolchain nightly-2025-02-01
-```
-
-3) Install the Pyodide wasm-eh sysroot (required to avoid dynamic linking errors like `invoke_iiii`):
-
-```
-curl -L -o /tmp/emcc-4.0.9_nightly-2025-02-01.tar.bz2 \
-  https://github.com/pyodide/rust-emscripten-wasm-eh-sysroot/releases/download/emcc-4.0.9_nightly-2025-02-01/emcc-4.0.9_nightly-2025-02-01.tar.bz2
-mkdir -p /tmp/emscripten-sysroot
-tar -xjf /tmp/emcc-4.0.9_nightly-2025-02-01.tar.bz2 -C /tmp/emscripten-sysroot
-rsync -a /tmp/emscripten-sysroot/wasm32-unknown-emscripten/ \
-  ~/.rustup/toolchains/nightly-2025-02-01-$(rustc -vV | awk '/^host:/ {print $2}')/lib/rustlib/wasm32-unknown-emscripten/
-```
-
-4) Build the wheel:
-
-```
-cd bayesian_bm25_rs
-TOOLCHAIN_BIN="$HOME/.rustup/toolchains/nightly-2025-02-01-$(rustc -vV | awk '/^host:/ {print $2}')/bin"
-EMSDK_DIR="$PWD/.pyodide-xbuildenv-0.32.0/0.29.3/emsdk"
-PATH="$TOOLCHAIN_BIN:$EMSDK_DIR:$EMSDK_DIR/upstream/emscripten:$PATH" \
-RUSTC="$TOOLCHAIN_BIN/rustc" \
-CARGO="$TOOLCHAIN_BIN/cargo" \
-CARGO_HOME="$PWD/.cargo" \
-RUSTFLAGS="-C link-arg=-sSIDE_MODULE=2 -Z link-native-libraries=yes -Z emscripten-wasm-eh" \
-PYODIDE_XBUILDENV_PATH="$PWD/.pyodide-xbuildenv-0.32.0" \
-CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="/usr/bin/cc" \
-pyodide build -o dist
-```
-
-5) Test in a Pyodide venv:
-
-```
-pyodide venv .pyodide-venv --clear --extra-search-dir dist
-.pyodide-venv/bin/pip install dist/bayesian_bm25_rs-0.1.0-cp313-cp313-pyodide_2025_0_wasm32.whl
-.pyodide-venv/bin/python - <<'PY'
 import bayesian_bm25 as bb
+
+corpus = bb.Corpus()
+corpus.add_document("d1", "neural networks for ranking", [0.1] * 8)
+corpus.add_document("d2", "bm25 is a strong baseline", [0.2] * 8)
+corpus.build_index()  # required before creating scorers
+
+bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+print(bm25.idf("bm25"))
+```
+
+### 3) Bayesian calibration + hybrid fusion
+
+```
+import bayesian_bm25 as bb
+
 corpus = bb.build_default_corpus()
 docs = corpus.documents()
 queries = bb.build_default_queries()
-scorer = bb.BM25Scorer(corpus, 1.2, 0.75)
-print("score0", scorer.score(queries[0].terms, docs[0]))
-PY
+
+bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+bayes = bb.BayesianBM25Scorer(bm25, 1.0, 0.5)
+vector = bb.VectorScorer()
+hybrid = bb.HybridScorer(bayes, vector)
+
+q = queries[0]
+prob_or = hybrid.score_or(q.terms, q.embedding, docs[0])
+prob_and = hybrid.score_and(q.terms, q.embedding, docs[0])
+print("OR", prob_or, "AND", prob_and)
 ```
 
-If you hit toolchain errors, see `docs/pyodide.md` for notes.
-
-## Scope and Validation Goals
-
-The experiments are designed to check the core claims of the Bayesian BM25 formulation:
-
-1) **BM25 Formula Equivalence**: The standard and rewritten BM25 expressions are algebraically identical.
-2) **Score Calibration**: Bayesian outputs are bounded in [0, 1] and preserve BM25 ordering.
-3) **Monotonicity Preservation**: Higher term frequency increases posterior probability (for similar lengths).
-4) **Prior Bounds**: Composite priors remain within conservative bounds [0.1, 0.9].
-5) **IDF Properties**: Non-negativity (for df <= N/2), monotone decrease with df, and score upper bounds.
-6) **Hybrid Search Bounds**: AND <= min(inputs), OR >= max(inputs) for query-document pairs.
-7) **Method Comparison**: Bayesian fusion vs naive sum vs RRF for ranking effects.
-8) **Numerical Stability**: Log-space computation avoids NaN/Inf under extreme inputs.
-9) **Parameter Learning**: Gradient descent reduces cross-entropy and learns alpha > 0.
-10) **Conjunction/Disjunction Bounds**: AND <= OR and within min/max across many probability tuples.
-
-## Experiments (Correspondence with the Paper)
-
-| # | Experiment | Paper Reference | Check |
-|---|-----------|-----------------|-------|
-| 1 | BM25 Formula Equivalence | Def 1.1.1, 3.2.1 | Standard vs rewritten BM25 scores identical |
-| 2 | Score Calibration | Sec 4 | Bayesian outputs in [0,1], ranking order preserved |
-| 3 | Monotonicity Preservation | Thm 4.3.1 | Higher TF yields higher posterior (same length) |
-| 4 | Prior Bounds | Thm 4.2.4 | Composite priors bounded in [0.1, 0.9] |
-| 5 | IDF Properties | Thm 3.1.2, 3.1.3, 3.2.3 | IDF properties and score upper bound |
-| 6 | Hybrid Search Quality | Thm 5.1.2, 5.2.2 | AND/OR bounds for lexical+vector probabilities |
-| 7 | Naive vs RRF vs Bayesian | Thm 1.2.2, Def 1.3.1 | Ranking comparisons across fusion methods |
-| 8 | Log-space Stability | Thm 5.3.1, Def 5.3.2 | No NaN/Inf for extreme values |
-| 9 | Parameter Learning | Alg 8.3.1, Def 8.1.1 | Loss decreases; alpha > 0 |
-| 10 | Conjunction/Disjunction Bounds | Thm 5.1.2, 5.2.2 | AND <= min, OR >= max, AND <= OR |
-
-## Package Structure
+## Run the Experiments (Python)
 
 ```
-bayesian_bm25_rs/
-  Cargo.toml
-  README.md
-  src/
-    lib.rs
-    main.rs
-    math_utils.rs
-    tokenizer.rs
-    corpus.rs
-    bm25_scorer.rs
-    bayesian_scorer.rs
-    vector_scorer.rs
-    hybrid_scorer.rs
-    parameter_learner.rs
-    experiments.rs
+import bayesian_bm25 as bb
+
+results = bb.run_experiments()
+print(all(r.passed for r in results))
 ```
 
-Module dependency flow:
+Each result has `name`, `passed`, and `details` fields.
+
+## Run the Experiments (Rust)
 
 ```
-math_utils        (no deps)
-tokenizer         (no deps)
-corpus            -> tokenizer
-bm25_scorer       -> corpus, math_utils
-bayesian_scorer   -> bm25_scorer, math_utils
-vector_scorer     -> math_utils
-hybrid_scorer     -> bayesian_scorer, vector_scorer, math_utils
-parameter_learner -> math_utils
-experiments       -> all above
-main              -> experiments, corpus, tokenizer
+cargo run --bin run_experiments
 ```
 
-## Test Corpus
+## Build (Rust)
 
-- 20 documents in 4 thematic clusters (ML, IR, DB, and cross-cutting).
-- Each document has an 8-dimensional, hand-crafted embedding.
-- 7 queries include tokenized terms, query embeddings, and relevance judgments.
+```
+make build
+```
 
-Embedding dimensions: `[ML, DL/neural, IR/search, ranking, DB, distributed, probability, vectors]`.
+## Pyodide / WASM
 
-## Key Formulas Implemented
+Pyodide builds are supported. See `docs/pyodide.md` for the tested toolchain setup and wheel build flow.
 
-**BM25 (Definition 1.1.1)**
+## What’s Included
 
-score(t, d) = IDF(t) * (k1 + 1) * tf / (k1 * norm + tf)
+- **BM25** (standard + rewritten form)
+- **Bayesian BM25** (sigmoid likelihood, informative priors)
+- **Vector similarity** (cosine)
+- **Hybrid fusion** (probabilistic AND/OR, naive sum, RRF)
+- **Parameter learning** (cross-entropy gradient descent)
+- **10 validation experiments** covering bounds, monotonicity, stability, and convergence
 
-**Robertson-Sparck Jones IDF (Definition 3.1.1)**
+## Packaging for PyPI
 
-IDF(t) = log((N - df(t) + 0.5) / (df(t) + 0.5))
+Build a wheel with maturin:
 
-**Bayesian Posterior (Theorem 4.1.3)**
+```
+python -m pip install maturin
+maturin build --release
+```
 
-P(rel | s) = (L * p) / (L * p + (1 - L)(1 - p))
-
-where L = sigmoid(alpha * (s - beta))
-
-**Probabilistic AND (Theorem 5.1.1)**
-
-P(A and B) = P(A) * P(B)
-
-**Probabilistic OR (Theorem 5.2.1)**
-
-P(A or B) = 1 - (1 - P(A))(1 - P(B))
-
-**Cross-Entropy Loss (Definition 8.1.1)**
-
-L = -1/N * sum(y log p + (1 - y) log(1 - p))
-
-where p = sigmoid(alpha * (s - beta))
-
-## Requirements
-
-- Rust toolchain (edition 2021)
-- Optional Python bindings use PyO3 (enabled via feature `python`)
+This produces platform wheels under `target/wheels/` (native) and `dist/` (Pyodide, when built via `pyodide build`).
