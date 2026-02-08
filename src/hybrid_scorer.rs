@@ -1,27 +1,43 @@
 use std::rc::Rc;
 
 use crate::bayesian_scorer::BayesianBM25Scorer;
-use crate::math_utils::{safe_log, safe_prob, EPSILON};
+use crate::math_utils::{logit, safe_log, safe_prob, sigmoid, EPSILON};
 use crate::vector_scorer::VectorScorer;
 use crate::corpus::Document;
 
 pub struct HybridScorer {
     bayesian: Rc<BayesianBM25Scorer>,
     vector: Rc<VectorScorer>,
+    alpha: f64,
 }
 
 impl HybridScorer {
-    pub fn new(bayesian: Rc<BayesianBM25Scorer>, vector: Rc<VectorScorer>) -> Self {
-        Self { bayesian, vector }
+    pub fn new(bayesian: Rc<BayesianBM25Scorer>, vector: Rc<VectorScorer>, alpha: f64) -> Self {
+        Self { bayesian, vector, alpha }
     }
 
     pub fn probabilistic_and(&self, probs: &[f64]) -> f64 {
+        if probs.is_empty() {
+            return 0.0;
+        }
+        let n = probs.len();
+        if n == 1 {
+            return safe_prob(probs[0]);
+        }
+
+        // Stage 1: Geometric mean in log-space
         let mut log_sum = 0.0;
         for p in probs {
             let p = safe_prob(*p);
             log_sum += safe_log(p);
         }
-        log_sum.exp()
+        let geo_mean = (log_sum / n as f64).exp();
+
+        // Stage 2: Log-odds transformation with agreement bonus
+        let l_adjusted = logit(geo_mean) + self.alpha * (n as f64).ln();
+
+        // Stage 3: Return to probability space
+        sigmoid(l_adjusted)
     }
 
     pub fn probabilistic_or(&self, probs: &[f64]) -> f64 {

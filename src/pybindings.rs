@@ -313,9 +313,14 @@ pub struct PyHybridScorer {
 #[pymethods]
 impl PyHybridScorer {
     #[new]
-    fn new(bayesian: &PyBayesianBM25Scorer, vector: &PyVectorScorer) -> Self {
+    #[pyo3(signature = (bayesian, vector, alpha=None))]
+    fn new(bayesian: &PyBayesianBM25Scorer, vector: &PyVectorScorer, alpha: Option<f64>) -> Self {
         Self {
-            inner: HybridScorer::new(Rc::clone(&bayesian.inner), Rc::clone(&vector.inner)),
+            inner: HybridScorer::new(
+                Rc::clone(&bayesian.inner),
+                Rc::clone(&vector.inner),
+                alpha.unwrap_or(0.5),
+            ),
         }
     }
 

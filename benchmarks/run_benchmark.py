@@ -103,7 +103,7 @@ def parse_cutoffs(raw: str) -> List[int]:
 
 
 def build_corpus(docs: List[DocRecord]) -> bb.Corpus:
-    corpus = bb.Corpus()
+    corpus = bb.Corpus(None)
     for doc in docs:
         corpus.add_document(doc.doc_id, doc.text, doc.embedding)
     corpus.build_index()
@@ -261,6 +261,14 @@ def main() -> None:
     tokenizer = bb.Tokenizer()
     doc_objs = corpus.documents()
 
+    has_embeddings = any(
+        q.embedding is not None and len(q.embedding) > 0 for q in queries
+    )
+
+    vector = bb.VectorScorer()
+    hybrid_or = bb.HybridScorer(bayes, vector)
+    hybrid_and = bb.HybridScorer(bayes, vector)
+
     results = []
     results.append(
         evaluate(
@@ -284,6 +292,47 @@ def main() -> None:
             cutoffs,
         )
     )
+
+    if has_embeddings:
+        query_embedding_map = {}
+        for q in queries:
+            if q.embedding:
+                query_embedding_map[q.query_id] = q.embedding
+
+        def make_hybrid_fn(scorer_method):
+            def fn(terms, doc):
+                qid = None
+                for q in queries:
+                    q_terms = q.terms or tokenizer.tokenize(q.text)
+                    if q_terms == list(terms):
+                        qid = q.query_id
+                        break
+                emb = query_embedding_map.get(qid, [0.0] * len(doc.embedding))
+                return scorer_method(terms, emb, doc)
+            return fn
+
+        results.append(
+            evaluate(
+                queries,
+                doc_objs,
+                "hybrid_or",
+                make_hybrid_fn(hybrid_or.score_or),
+                qrels,
+                tokenizer,
+                cutoffs,
+            )
+        )
+        results.append(
+            evaluate(
+                queries,
+                doc_objs,
+                "hybrid_and",
+                make_hybrid_fn(hybrid_and.score_and),
+                qrels,
+                tokenizer,
+                cutoffs,
+            )
+        )
 
     table = format_table(results, cutoffs)
     print(table)

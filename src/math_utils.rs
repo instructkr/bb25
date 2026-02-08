@@ -14,6 +14,11 @@ pub fn safe_log(p: f64) -> f64 {
     p.max(EPSILON).ln()
 }
 
+pub fn logit(p: f64) -> f64 {
+    let p = clamp(p, EPSILON, 1.0 - EPSILON);
+    (p / (1.0 - p)).ln()
+}
+
 pub fn safe_prob(p: f64) -> f64 {
     clamp(p, EPSILON, 1.0 - EPSILON)
 }

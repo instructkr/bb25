@@ -47,7 +47,7 @@ impl ExperimentRunner {
         let bm25 = Rc::new(BM25Scorer::new(Rc::clone(&corpus), k1, b));
         let bayesian = Rc::new(BayesianBM25Scorer::new(Rc::clone(&bm25), 1.0, 0.5));
         let vector = Rc::new(VectorScorer::new());
-        let hybrid = HybridScorer::new(Rc::clone(&bayesian), Rc::clone(&vector));
+        let hybrid = HybridScorer::new(Rc::clone(&bayesian), Rc::clone(&vector), 0.5);
 
         Self {
             corpus,
@@ -331,17 +331,43 @@ impl ExperimentRunner {
 
                 let and_score = self.hybrid.probabilistic_and(&probs);
                 let or_score = self.hybrid.probabilistic_or(&probs);
-                let min_p = probs.iter().copied().fold(f64::INFINITY, f64::min);
-                let max_p = probs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
                 tests += 1;
-                if and_score > min_p + EPSILON {
+
+                // Log-odds conjunction: AND <= OR
+                if and_score > or_score + EPSILON {
                     passed = false;
                     violations.push(format!(
-                        "AND={:.6} > min={:.6} (doc={})",
-                        and_score, min_p, doc.id
+                        "AND={:.6} > OR={:.6} (doc={})",
+                        and_score, or_score, doc.id
                     ));
                 }
+
+                // Agreement amplification: both > 0.5 => AND > geometric mean
+                if bayesian_p > 0.5 && vector_p > 0.5 {
+                    let geo_mean = (bayesian_p * vector_p).sqrt();
+                    if and_score < geo_mean - EPSILON {
+                        passed = false;
+                        violations.push(format!(
+                            "no amplification: AND={:.6} < geo_mean={:.6} (doc={})",
+                            and_score, geo_mean, doc.id
+                        ));
+                    }
+                }
+
+                // Irrelevance preservation: both < 0.5 => AND < 0.5
+                if bayesian_p < 0.5 && vector_p < 0.5 {
+                    if and_score > 0.5 + EPSILON {
+                        passed = false;
+                        violations.push(format!(
+                            "irrelevance violated: AND={:.6} > 0.5 (doc={})",
+                            and_score, doc.id
+                        ));
+                    }
+                }
+
+                // OR >= max(p_i)
+                let max_p = probs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 if or_score < max_p - EPSILON {
                     passed = false;
                     violations.push(format!(
@@ -546,24 +572,9 @@ impl ExperimentRunner {
                 let probs = [p1, p2];
                 let and_result = self.hybrid.probabilistic_and(&probs);
                 let or_result = self.hybrid.probabilistic_or(&probs);
-                let min_p = p1.min(p2);
-                let max_p = p1.max(p2);
                 tests += 1;
 
-                if and_result > min_p + EPSILON {
-                    passed = false;
-                    violations.push(format!(
-                        "AND({:.2},{:.2})={:.6} > min={:.2}",
-                        p1, p2, and_result, min_p
-                    ));
-                }
-                if or_result < max_p - EPSILON {
-                    passed = false;
-                    violations.push(format!(
-                        "OR({:.2},{:.2})={:.6} < max={:.2}",
-                        p1, p2, or_result, max_p
-                    ));
-                }
+                // AND <= OR always
                 if and_result > or_result + EPSILON {
                     passed = false;
                     violations.push(format!(
@@ -571,9 +582,56 @@ impl ExperimentRunner {
                         p1, p2, and_result, or_result
                     ));
                 }
+
+                // Agreement amplification: both > 0.5 => AND > geo_mean
+                if p1 > 0.5 && p2 > 0.5 {
+                    let geo_mean = (p1 * p2).sqrt();
+                    if and_result < geo_mean - EPSILON {
+                        passed = false;
+                        violations.push(format!(
+                            "AND({:.2},{:.2})={:.6} < geo_mean={:.6}",
+                            p1, p2, and_result, geo_mean
+                        ));
+                    }
+                }
+
+                // Irrelevance preservation: both < 0.5 => AND < 0.5
+                if p1 < 0.5 && p2 < 0.5 {
+                    if and_result > 0.5 + EPSILON {
+                        passed = false;
+                        violations.push(format!(
+                            "AND({:.2},{:.2})={:.6} > 0.5",
+                            p1, p2, and_result
+                        ));
+                    }
+                }
+
+                // OR >= max(p_i) always
+                let max_p = p1.max(p2);
+                if or_result < max_p - EPSILON {
+                    passed = false;
+                    violations.push(format!(
+                        "OR({:.2},{:.2})={:.6} < max={:.2}",
+                        p1, p2, or_result, max_p
+                    ));
+                }
             }
         }
 
+        // Identity for single signal: AND(p) = p
+        for p in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let and_single = self.hybrid.probabilistic_and(&[p]);
+            tests += 1;
+            if (and_single - p).abs() > EPSILON {
+                passed = false;
+                violations.push(format!(
+                    "identity: AND({:.1})={:.6} != {:.1}",
+                    p, and_single, p
+                ));
+            }
+        }
+
+        // 3-signal tests
         for p1 in [0.1, 0.5, 0.9] {
             for p2 in [0.2, 0.6] {
                 for p3 in [0.3, 0.8] {
@@ -581,11 +639,23 @@ impl ExperimentRunner {
                     let and_result = self.hybrid.probabilistic_and(&probs);
                     let or_result = self.hybrid.probabilistic_or(&probs);
                     tests += 1;
-                    if and_result > probs.iter().copied().fold(f64::INFINITY, f64::min) + EPSILON {
+
+                    // AND <= OR
+                    if and_result > or_result + EPSILON {
                         passed = false;
                     }
+
+                    // OR >= max
                     if or_result < probs.iter().copied().fold(f64::NEG_INFINITY, f64::max) - EPSILON {
                         passed = false;
+                    }
+
+                    // All above 0.5 => AND > geo_mean
+                    if probs.iter().all(|&p| p > 0.5) {
+                        let geo_mean = (p1 * p2 * p3).powf(1.0 / 3.0);
+                        if and_result < geo_mean - EPSILON {
+                            passed = false;
+                        }
                     }
                 }
             }
