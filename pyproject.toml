@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "bb25"
-version = "0.1.1"
+version = "0.1.2"
 description = "Bayesian BM25 scoring and experimental validation (Rust core + Python bindings)"
 readme = "README.md"
 requires-python = ">=3.8"
