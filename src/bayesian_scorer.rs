@@ -23,13 +23,18 @@ impl BayesianBM25Scorer {
         0.2 + 0.7 * (tf as f64 / 10.0).min(1.0)
     }
 
+    /// Document length normalization prior (Eq. 26).
+    ///
+    /// Symmetric bell curve centered at ratio=0.5:
+    /// P_norm = 0.3 + 0.6 * (1 - min(1, |ratio - 0.5| * 2))
+    /// Peaks at 0.9 when doc_length/avg_doc_length = 0.5,
+    /// falls to 0.3 at extremes.
     pub fn norm_prior(&self, doc_length: usize, avg_doc_length: f64) -> f64 {
         if avg_doc_length < 1.0 {
             return 0.5;
         }
         let ratio = doc_length as f64 / avg_doc_length;
-        let prior = 1.0 / (1.0 + ratio);
-        clamp(prior, 0.1, 0.9)
+        0.3 + 0.6 * (1.0 - ((ratio - 0.5).abs() * 2.0).min(1.0))
     }
 
     pub fn composite_prior(&self, tf: usize, doc_length: usize, avg_doc_length: f64) -> f64 {

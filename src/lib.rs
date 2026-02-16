@@ -16,6 +16,7 @@ pub use math_utils::{
     clamp,
     cosine_similarity,
     dot_product,
+    logit,
     safe_log,
     safe_prob,
     sigmoid,
