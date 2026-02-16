@@ -2,6 +2,8 @@
 
 bb25 is a fast, self-contained BM25 + Bayesian calibration implementation with a minimal Python API. It also includes a small reference corpus and experiment suite so you can validate the expected numerical properties.
 
+> **Original author's implementation**: The paper author (Jaepil Jeong, Cognica) maintains the reference Python implementation at [cognica-io/bayesian-bm25](https://github.com/cognica-io/bayesian-bm25). That library focuses on production-ready score-to-probability conversion with BM25 ranking order preservation, auto parameter estimation, online learning, and log-odds conjunction for hybrid fusion. If you need a drop-in probability transform for an existing search system, use the original. bb25 is a Rust-core experimental validation that prioritizes performance and end-to-end reproducibility of the paper's claims.
+
 ## Install
 
 ```
@@ -91,11 +93,11 @@ This is where BB25 shines: Bayesian Hybrid beats the classic BM25 Hybrid.
 
 On the English dataset (SQuAD), combining bb25 with Dense (BGE-M3) achieves higher performance than the BM25 + Dense baseline (+1.0%p NDCG). This suggests the probabilistic score from bb25 blends more smoothly with vector scores (less scale mismatch than a simple weighted sum).
 
-Original paper:
+Original paper and implementations:
 
-```
-https://www.researchgate.net/publication/400212695_Bayesian_BM25_A_Probabilistic_Framework_for_Hybrid_Text_and_Vector_Search
-```
+- **Paper**: [Bayesian BM25: A Probabilistic Framework for Hybrid Text and Vector Search](https://www.researchgate.net/publication/400212695_Bayesian_BM25_A_Probabilistic_Framework_for_Hybrid_Text_and_Vector_Search)
+- **Author's reference implementation (Python)**: [cognica-io/bayesian-bm25](https://github.com/cognica-io/bayesian-bm25)
+- **This implementation (Rust + Python bindings)**: [instructkr/bb25](https://github.com/instructkr/bb25)
 
 ## Build from source (Rust)
 
