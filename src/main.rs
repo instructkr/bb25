@@ -23,8 +23,9 @@ fn main() {
     println!();
 
     let mut all_passed = true;
-    for (name, passed, details) in results {
-        let status = if passed { "PASS" } else { "FAIL" };
+    let total = results.len();
+    for (name, passed, details) in &results {
+        let status = if *passed { "PASS" } else { "FAIL" };
         if !passed {
             all_passed = false;
         }
@@ -38,7 +39,7 @@ fn main() {
 
     println!("{}", "=".repeat(72));
     if all_passed {
-        println!("All 10 experiments PASSED.");
+        println!("All {} experiments PASSED.", total);
     } else {
         println!("Some experiments FAILED.");
     }

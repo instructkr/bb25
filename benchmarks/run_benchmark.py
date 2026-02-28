@@ -83,13 +83,20 @@ def load_qrels(path: Path) -> Dict[str, Dict[str, float]]:
         return qrels
 
     with path.open("r", encoding="utf-8") as handle:
+        first_line = True
         for line in handle:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split()
+            parts = line.split("\t") if "\t" in line else line.split()
             if len(parts) < 3:
                 continue
+            if first_line:
+                first_line = False
+                try:
+                    float(parts[2])
+                except ValueError:
+                    continue
             qid, did, rel_str = parts[0], parts[1], parts[2]
             rel = float(rel_str)
             qrels.setdefault(qid, {})[did] = rel

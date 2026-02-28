@@ -4,6 +4,7 @@ use std::rc::Rc;
 use crate::bayesian_scorer::BayesianBM25Scorer;
 use crate::bm25_scorer::BM25Scorer;
 use crate::corpus::{Corpus, Document};
+use crate::fusion;
 use crate::hybrid_scorer::HybridScorer;
 use crate::math_utils::{safe_log, sigmoid, EPSILON};
 use crate::parameter_learner::ParameterLearner;
@@ -45,7 +46,7 @@ pub struct ExperimentRunner {
 impl ExperimentRunner {
     pub fn new(corpus: Rc<Corpus>, queries: Vec<Query>, k1: f64, b: f64) -> Self {
         let bm25 = Rc::new(BM25Scorer::new(Rc::clone(&corpus), k1, b));
-        let bayesian = Rc::new(BayesianBM25Scorer::new(Rc::clone(&bm25), 1.0, 0.5));
+        let bayesian = Rc::new(BayesianBM25Scorer::new(Rc::clone(&bm25), 1.0, 0.5, None));
         let vector = Rc::new(VectorScorer::new());
         let hybrid = HybridScorer::new(Rc::clone(&bayesian), Rc::clone(&vector), 0.5);
 
@@ -71,6 +72,9 @@ impl ExperimentRunner {
             ("8. Log-space Numerical Stability", ExperimentRunner::exp8_numerical_stability),
             ("9. Parameter Learning Convergence", ExperimentRunner::exp9_parameter_learning),
             ("10. Conjunction/Disjunction Bounds", ExperimentRunner::exp10_conjunction_disjunction),
+            ("11. Base Rate Prior", ExperimentRunner::exp11_base_rate_prior),
+            ("12. Log-Odds Conjunction Properties", ExperimentRunner::exp12_log_odds_conjunction),
+            ("13. Fusion Primitives", ExperimentRunner::exp13_fusion_primitives),
         ];
 
         experiments
@@ -667,6 +671,230 @@ impl ExperimentRunner {
             detail.push_str(", violations: ");
             detail.push_str(&preview);
         }
+
+        (passed, detail)
+    }
+
+    fn exp11_base_rate_prior(&self) -> (bool, String) {
+        let mut passed = true;
+        let mut details: Vec<String> = Vec::new();
+
+        let query = &self.queries[0];
+
+        // Scorer without base_rate (default)
+        let scorer_none = BayesianBM25Scorer::new(Rc::clone(&self.bm25), 1.0, 0.5, None);
+
+        // Low base_rate should reduce posteriors
+        let scorer_low = BayesianBM25Scorer::new(Rc::clone(&self.bm25), 1.0, 0.5, Some(0.01));
+
+        // base_rate=0.5 should be neutral (no change from step 1)
+        let scorer_neutral = BayesianBM25Scorer::new(Rc::clone(&self.bm25), 1.0, 0.5, Some(0.5));
+
+        let mut low_reduces = true;
+        let mut neutral_ok = true;
+        let mut all_in_range = true;
+
+        for doc in self.corpus.documents() {
+            let score_none = scorer_none.score(&query.terms, doc);
+            let score_low = scorer_low.score(&query.terms, doc);
+            let score_neutral = scorer_neutral.score(&query.terms, doc);
+
+            // Low base_rate should reduce posteriors vs None
+            if score_none > EPSILON && score_low > score_none + EPSILON {
+                low_reduces = false;
+                details.push(format!(
+                    "doc={}: low={:.6} > none={:.6}",
+                    doc.id, score_low, score_none
+                ));
+            }
+
+            // base_rate=0.5 should be approximately neutral
+            if (score_neutral - score_none).abs() > 1e-4 {
+                neutral_ok = false;
+                details.push(format!(
+                    "doc={}: neutral={:.6} != none={:.6}",
+                    doc.id, score_neutral, score_none
+                ));
+            }
+
+            // All results must be in (0, 1)
+            for &s in &[score_none, score_low, score_neutral] {
+                if s < -EPSILON || s > 1.0 + EPSILON {
+                    all_in_range = false;
+                }
+            }
+        }
+
+        if !low_reduces {
+            passed = false;
+        }
+        if !neutral_ok {
+            passed = false;
+        }
+        if !all_in_range {
+            passed = false;
+        }
+
+        let mut detail = format!(
+            "low_reduces={}, neutral_ok={}, all_in_range={}",
+            low_reduces, neutral_ok, all_in_range
+        );
+        if !details.is_empty() {
+            let preview = details.into_iter().take(3).collect::<Vec<_>>().join("; ");
+            detail.push_str(", violations: ");
+            detail.push_str(&preview);
+        }
+
+        (passed, detail)
+    }
+
+    fn exp12_log_odds_conjunction(&self) -> (bool, String) {
+        let mut passed = true;
+        let mut violations: Vec<String> = Vec::new();
+
+        // Agreement amplification: conj([0.9, 0.9]) > 0.9
+        let result = fusion::log_odds_conjunction(&[0.9, 0.9], None, None);
+        if result <= 0.9 {
+            passed = false;
+            violations.push(format!("agreement: conj([0.9,0.9])={:.6} <= 0.9", result));
+        }
+
+        // Disagreement moderation: conj([0.9, 0.1]) should be near 0.5
+        let result = fusion::log_odds_conjunction(&[0.9, 0.1], None, None);
+        if (result - 0.5).abs() > 0.15 {
+            passed = false;
+            violations.push(format!("disagreement: conj([0.9,0.1])={:.6} not near 0.5", result));
+        }
+
+        // Neutral identity: conj([0.5, 0.5]) = 0.5
+        let result = fusion::log_odds_conjunction(&[0.5, 0.5], None, None);
+        if (result - 0.5).abs() > EPSILON {
+            passed = false;
+            violations.push(format!("neutral: conj([0.5,0.5])={:.6} != 0.5", result));
+        }
+
+        // More signals amplify: conj([0.8]*3) > conj([0.8]*2)
+        let conj2 = fusion::log_odds_conjunction(&[0.8, 0.8], None, None);
+        let conj3 = fusion::log_odds_conjunction(&[0.8, 0.8, 0.8], None, None);
+        if conj3 <= conj2 {
+            passed = false;
+            violations.push(format!(
+                "amplification: conj([0.8]*3)={:.6} <= conj([0.8]*2)={:.6}",
+                conj3, conj2
+            ));
+        }
+
+        // Alpha effect: higher alpha = stronger amplification
+        let low_alpha = fusion::log_odds_conjunction(&[0.8, 0.8], Some(0.3), None);
+        let high_alpha = fusion::log_odds_conjunction(&[0.8, 0.8], Some(0.8), None);
+        if high_alpha <= low_alpha {
+            passed = false;
+            violations.push(format!(
+                "alpha: high_alpha={:.6} <= low_alpha={:.6}",
+                high_alpha, low_alpha
+            ));
+        }
+
+        // Weighted with uniform weights + alpha=0 matches unweighted alpha=0
+        let uniform_w = vec![0.5, 0.5];
+        let probs = [0.7, 0.8];
+        let weighted = fusion::log_odds_conjunction(&probs, Some(0.0), Some(&uniform_w));
+        let unweighted = fusion::log_odds_conjunction(&probs, Some(0.0), None);
+        if (weighted - unweighted).abs() > 1e-6 {
+            passed = false;
+            violations.push(format!(
+                "uniform_weights: weighted={:.6} != unweighted={:.6}",
+                weighted, unweighted
+            ));
+        }
+
+        let detail = if violations.is_empty() {
+            "all properties verified".to_string()
+        } else {
+            let preview = violations.into_iter().take(3).collect::<Vec<_>>().join("; ");
+            format!("violations: {}", preview)
+        };
+
+        (passed, detail)
+    }
+
+    fn exp13_fusion_primitives(&self) -> (bool, String) {
+        let mut passed = true;
+        let mut violations: Vec<String> = Vec::new();
+
+        // prob_not: involution (not(not(p)) = p)
+        for &p in &[0.1, 0.3, 0.5, 0.7, 0.9] {
+            let roundtrip = fusion::prob_not(fusion::prob_not(p));
+            if (roundtrip - p).abs() > 1e-8 {
+                passed = false;
+                violations.push(format!("involution: not(not({:.1}))={:.6} != {:.1}", p, roundtrip, p));
+            }
+        }
+
+        // prob_not: bounds
+        let not_low = fusion::prob_not(0.01);
+        let not_high = fusion::prob_not(0.99);
+        if not_low < 0.0 || not_low > 1.0 || not_high < 0.0 || not_high > 1.0 {
+            passed = false;
+            violations.push("prob_not out of bounds".to_string());
+        }
+
+        // De Morgan's law: not(and(p1, p2)) = or(not(p1), not(p2))
+        for &(p1, p2) in &[(0.3, 0.7), (0.1, 0.9), (0.5, 0.5)] {
+            let lhs = fusion::prob_not(fusion::prob_and(&[p1, p2]));
+            let rhs = fusion::prob_or(&[fusion::prob_not(p1), fusion::prob_not(p2)]);
+            if (lhs - rhs).abs() > 1e-8 {
+                passed = false;
+                violations.push(format!(
+                    "de_morgan: not(and({:.1},{:.1}))={:.6} != or(not,not)={:.6}",
+                    p1, p2, lhs, rhs
+                ));
+            }
+        }
+
+        // balanced_log_odds_fusion: output dimension
+        let sparse = vec![0.3, 0.6, 0.8];
+        let dense = vec![0.1, 0.5, 0.9];
+        let fused = fusion::balanced_log_odds_fusion(&sparse, &dense, 0.5);
+        if fused.len() != sparse.len() {
+            passed = false;
+            violations.push(format!("fusion dim: {} != {}", fused.len(), sparse.len()));
+        }
+
+        // balanced_log_odds_fusion: weight effect (weight=1.0 should favor dense)
+        let fused_dense = fusion::balanced_log_odds_fusion(&sparse, &dense, 1.0);
+        let fused_sparse = fusion::balanced_log_odds_fusion(&sparse, &dense, 0.0);
+        if fused_dense == fused_sparse {
+            passed = false;
+            violations.push("weight has no effect".to_string());
+        }
+
+        // cosine_to_probability: bounds
+        for &s in &[-1.0, -0.5, 0.0, 0.5, 1.0] {
+            let p = fusion::cosine_to_probability(s);
+            if p <= 0.0 || p >= 1.0 {
+                passed = false;
+                violations.push(format!("cos_to_prob({:.1})={:.6} out of (0,1)", s, p));
+            }
+        }
+
+        // cosine_to_probability: monotonicity
+        let mut prev = fusion::cosine_to_probability(-1.0);
+        for &s in &[-0.5, 0.0, 0.5, 1.0] {
+            let curr = fusion::cosine_to_probability(s);
+            if curr < prev - EPSILON {
+                passed = false;
+                violations.push(format!("cos_to_prob not monotonic at {:.1}", s));
+            }
+            prev = curr;
+        }
+
+        let detail = if violations.is_empty() {
+            "all primitives verified".to_string()
+        } else {
+            let preview = violations.into_iter().take(3).collect::<Vec<_>>().join("; ");
+            format!("violations: {}", preview)
+        };
 
         (passed, detail)
     }

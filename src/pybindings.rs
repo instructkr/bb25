@@ -10,6 +10,7 @@ use crate::bm25_scorer::BM25Scorer;
 use crate::corpus::{Corpus as CoreCorpus, Document};
 use crate::defaults::{build_default_corpus, build_default_queries};
 use crate::experiments::{ExperimentRunner, Query};
+use crate::fusion;
 use crate::hybrid_scorer::HybridScorer;
 use crate::parameter_learner::{ParameterLearner, ParameterLearnerResult};
 use crate::tokenizer::Tokenizer;
@@ -243,12 +244,14 @@ pub struct PyBayesianBM25Scorer {
 #[pymethods]
 impl PyBayesianBM25Scorer {
     #[new]
-    fn new(bm25: &PyBM25Scorer, alpha: Option<f64>, beta: Option<f64>) -> Self {
+    #[pyo3(signature = (bm25, alpha=None, beta=None, base_rate=None))]
+    fn new(bm25: &PyBM25Scorer, alpha: Option<f64>, beta: Option<f64>, base_rate: Option<f64>) -> Self {
         Self {
             inner: Rc::new(BayesianBM25Scorer::new(
                 Rc::clone(&bm25.inner),
                 alpha.unwrap_or(1.0),
                 beta.unwrap_or(0.5),
+                base_rate,
             )),
         }
     }
@@ -279,6 +282,11 @@ impl PyBayesianBM25Scorer {
 
     fn score(&self, query_terms: Vec<String>, doc: &PyDocument) -> f64 {
         self.inner.score(&query_terms, &doc.inner)
+    }
+
+    #[getter]
+    fn base_rate(&self) -> Option<f64> {
+        self.inner.base_rate()
     }
 }
 
@@ -522,6 +530,72 @@ fn build_default_queries_py(py: Python) -> PyResult<Vec<Py<PyQuery>>> {
     Ok(out)
 }
 
+#[pyfunction(name = "prob_not")]
+fn prob_not_py(prob: f64) -> f64 {
+    fusion::prob_not(prob)
+}
+
+#[pyfunction(name = "prob_and")]
+fn prob_and_py(probs: Vec<f64>) -> f64 {
+    fusion::prob_and(&probs)
+}
+
+#[pyfunction(name = "prob_or")]
+fn prob_or_py(probs: Vec<f64>) -> f64 {
+    fusion::prob_or(&probs)
+}
+
+#[pyfunction(name = "cosine_to_probability")]
+fn cosine_to_probability_py(score: f64) -> f64 {
+    fusion::cosine_to_probability(score)
+}
+
+#[pyfunction(name = "log_odds_conjunction")]
+#[pyo3(signature = (probs, alpha=None, weights=None))]
+fn log_odds_conjunction_py(
+    probs: Vec<f64>,
+    alpha: Option<f64>,
+    weights: Option<Vec<f64>>,
+) -> PyResult<f64> {
+    if let Some(ref w) = weights {
+        if w.len() != probs.len() {
+            return Err(PyValueError::new_err(
+                "weights length must match probs length",
+            ));
+        }
+        if !w.iter().all(|&wi| wi >= 0.0) {
+            return Err(PyValueError::new_err("all weights must be non-negative"));
+        }
+        if (w.iter().sum::<f64>() - 1.0).abs() >= 1e-6 {
+            return Err(PyValueError::new_err("weights must sum to 1.0"));
+        }
+    }
+    Ok(fusion::log_odds_conjunction(
+        &probs,
+        alpha,
+        weights.as_deref(),
+    ))
+}
+
+#[pyfunction(name = "balanced_log_odds_fusion")]
+#[pyo3(signature = (sparse_probs, dense_similarities, weight=None))]
+fn balanced_log_odds_fusion_py(
+    sparse_probs: Vec<f64>,
+    dense_similarities: Vec<f64>,
+    weight: Option<f64>,
+) -> PyResult<Vec<f64>> {
+    if sparse_probs.len() != dense_similarities.len() {
+        return Err(PyValueError::new_err(
+            "sparse_probs and dense_similarities must have the same length",
+        ));
+    }
+    Ok(fusion::balanced_log_odds_fusion(
+        &sparse_probs,
+        &dense_similarities,
+        weight.unwrap_or(0.5),
+    ))
+}
+
 #[pyfunction(name = "run_experiments")]
 fn run_experiments_py() -> Vec<PyExperimentResult> {
     let corpus = Rc::new(build_default_corpus());
@@ -552,6 +626,12 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_default_corpus_py, m)?)?;
     m.add_function(wrap_pyfunction!(build_default_queries_py, m)?)?;
     m.add_function(wrap_pyfunction!(run_experiments_py, m)?)?;
+    m.add_function(wrap_pyfunction!(prob_not_py, m)?)?;
+    m.add_function(wrap_pyfunction!(prob_and_py, m)?)?;
+    m.add_function(wrap_pyfunction!(prob_or_py, m)?)?;
+    m.add_function(wrap_pyfunction!(cosine_to_probability_py, m)?)?;
+    m.add_function(wrap_pyfunction!(log_odds_conjunction_py, m)?)?;
+    m.add_function(wrap_pyfunction!(balanced_log_odds_fusion_py, m)?)?;
 
     m.add("__all__", vec![
         "Tokenizer",
@@ -569,6 +649,12 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "build_default_corpus",
         "build_default_queries",
         "run_experiments",
+        "prob_not",
+        "prob_and",
+        "prob_or",
+        "cosine_to_probability",
+        "log_odds_conjunction",
+        "balanced_log_odds_fusion",
     ])?;
 
     Ok(())

@@ -5,6 +5,7 @@ pub mod bm25_scorer;
 pub mod bayesian_scorer;
 pub mod vector_scorer;
 pub mod hybrid_scorer;
+pub mod fusion;
 pub mod parameter_learner;
 pub mod experiments;
 pub mod defaults;
@@ -22,6 +23,15 @@ pub use math_utils::{
     sigmoid,
     vector_magnitude,
     EPSILON,
+};
+
+pub use fusion::{
+    balanced_log_odds_fusion,
+    cosine_to_probability,
+    log_odds_conjunction,
+    prob_and,
+    prob_not,
+    prob_or,
 };
 
 pub use tokenizer::Tokenizer;

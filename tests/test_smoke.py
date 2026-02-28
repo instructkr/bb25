@@ -6,7 +6,7 @@ import bb25 as bb
 class SmokeTests(unittest.TestCase):
     def test_run_experiments(self):
         results = bb.run_experiments()
-        self.assertEqual(len(results), 10)
+        self.assertEqual(len(results), 13)
         self.assertTrue(all(r.passed for r in results))
 
     def test_default_builders(self):
