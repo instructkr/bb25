@@ -1,4 +1,25 @@
-use crate::math_utils::{logit, safe_prob, sigmoid};
+use crate::math_utils::{logit, min_max_normalize, safe_prob, sigmoid};
+
+/// Gating function for sparse signal logits before aggregation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Gating {
+    /// No gating (pass-through).
+    #[default]
+    NoGating,
+    /// MAP estimate under sparse prior (Theorem 6.5.3): max(0, logit).
+    Relu,
+    /// Bayes estimate under sparse prior (Theorem 6.7.4): logit * sigmoid(logit).
+    Swish,
+}
+
+/// Apply gating function to a single logit value.
+fn apply_gating(logit_val: f64, gating: Gating) -> f64 {
+    match gating {
+        Gating::NoGating => logit_val,
+        Gating::Relu => logit_val.max(0.0),
+        Gating::Swish => logit_val * sigmoid(logit_val),
+    }
+}
 
 /// Maps cosine similarity [-1, 1] to probability (0, 1).
 pub fn cosine_to_probability(score: f64) -> f64 {
@@ -41,21 +62,32 @@ pub fn prob_or(probs: &[f64]) -> f64 {
 ///   sigmoid(n^alpha * sum(w_i * logit(p_i)))
 ///   Default alpha = 0.0
 ///   Requires: all w_i >= 0, sum(w_i) = 1.0
+///
+/// Gating is applied to logit values before aggregation:
+///   NoGating: pass-through
+///   Relu: max(0, logit) -- MAP under sparse prior (Theorem 6.5.3)
+///   Swish: logit * sigmoid(logit) -- Bayes under sparse prior (Theorem 6.7.4)
 pub fn log_odds_conjunction(
     probs: &[f64],
     alpha: Option<f64>,
     weights: Option<&[f64]>,
+    gating: Gating,
 ) -> f64 {
     if probs.is_empty() {
         return 0.5;
     }
     let n = probs.len() as f64;
 
+    // Compute gated logits
+    let gated_logits: Vec<f64> = probs
+        .iter()
+        .map(|&p| apply_gating(logit(safe_prob(p)), gating))
+        .collect();
+
     match weights {
         None => {
             let effective_alpha = alpha.unwrap_or(0.5);
-            let logit_sum: f64 = probs.iter().map(|&p| logit(safe_prob(p))).sum();
-            let l_bar = logit_sum / n;
+            let l_bar: f64 = gated_logits.iter().sum::<f64>() / n;
             sigmoid(l_bar * n.powf(effective_alpha))
         }
         Some(w) => {
@@ -74,10 +106,10 @@ pub fn log_odds_conjunction(
             );
 
             let effective_alpha = alpha.unwrap_or(0.0);
-            let weighted_logit_sum: f64 = probs
+            let weighted_logit_sum: f64 = gated_logits
                 .iter()
                 .zip(w.iter())
-                .map(|(&p, &wi)| wi * logit(safe_prob(p)))
+                .map(|(&l, &wi)| wi * l)
                 .sum();
             sigmoid(n.powf(effective_alpha) * weighted_logit_sum)
         }
@@ -109,17 +141,4 @@ pub fn balanced_log_odds_fusion(
     (0..n)
         .map(|i| weight * dense_norm[i] + (1.0 - weight) * sparse_norm[i])
         .collect()
-}
-
-fn min_max_normalize(values: &[f64]) -> Vec<f64> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-    let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let range = max_val - min_val;
-    if range < 1e-12 {
-        return vec![0.0; values.len()];
-    }
-    values.iter().map(|&v| (v - min_val) / range).collect()
 }

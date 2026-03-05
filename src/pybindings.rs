@@ -15,6 +15,35 @@ use crate::hybrid_scorer::HybridScorer;
 use crate::parameter_learner::{ParameterLearner, ParameterLearnerResult};
 use crate::tokenizer::Tokenizer;
 use crate::vector_scorer::VectorScorer;
+use crate::probability::BayesianProbabilityTransform;
+use crate::learnable_weights::LearnableLogOddsWeights;
+use crate::attention_weights::AttentionLogOddsWeights;
+use crate::metrics;
+use crate::debug::{FusionDebugger, BM25SignalTrace, VectorSignalTrace, FusionTrace, DocumentTrace, ComparisonResult, NotTrace};
+
+fn parse_gating(gating: Option<&str>) -> PyResult<fusion::Gating> {
+    match gating {
+        None | Some("none") => Ok(fusion::Gating::NoGating),
+        Some("relu") => Ok(fusion::Gating::Relu),
+        Some("swish") => Ok(fusion::Gating::Swish),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "gating must be 'none', 'relu', or 'swish', got '{}'",
+            other
+        ))),
+    }
+}
+
+fn parse_training_mode(mode: Option<&str>) -> PyResult<crate::probability::TrainingMode> {
+    match mode {
+        None | Some("balanced") => Ok(crate::probability::TrainingMode::Balanced),
+        Some("prior_aware") => Ok(crate::probability::TrainingMode::PriorAware),
+        Some("prior_free") => Ok(crate::probability::TrainingMode::PriorFree),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "mode must be 'balanced', 'prior_aware', or 'prior_free', got '{}'",
+            other
+        ))),
+    }
+}
 
 #[pyclass(name = "Tokenizer")]
 pub struct PyTokenizer {
@@ -551,11 +580,12 @@ fn cosine_to_probability_py(score: f64) -> f64 {
 }
 
 #[pyfunction(name = "log_odds_conjunction")]
-#[pyo3(signature = (probs, alpha=None, weights=None))]
+#[pyo3(signature = (probs, alpha=None, weights=None, gating=None))]
 fn log_odds_conjunction_py(
     probs: Vec<f64>,
     alpha: Option<f64>,
     weights: Option<Vec<f64>>,
+    gating: Option<&str>,
 ) -> PyResult<f64> {
     if let Some(ref w) = weights {
         if w.len() != probs.len() {
@@ -570,10 +600,12 @@ fn log_odds_conjunction_py(
             return Err(PyValueError::new_err("weights must sum to 1.0"));
         }
     }
+    let g = parse_gating(gating)?;
     Ok(fusion::log_odds_conjunction(
         &probs,
         alpha,
         weights.as_deref(),
+        g,
     ))
 }
 
@@ -596,6 +628,784 @@ fn balanced_log_odds_fusion_py(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// BayesianProbabilityTransform
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "BayesianProbabilityTransform")]
+pub struct PyBayesianProbabilityTransform {
+    inner: RefCell<BayesianProbabilityTransform>,
+}
+
+#[pymethods]
+impl PyBayesianProbabilityTransform {
+    #[new]
+    #[pyo3(signature = (alpha=None, beta=None, base_rate=None))]
+    fn new(alpha: Option<f64>, beta: Option<f64>, base_rate: Option<f64>) -> PyResult<Self> {
+        if let Some(br) = base_rate {
+            if br <= 0.0 || br >= 1.0 {
+                return Err(PyValueError::new_err(format!(
+                    "base_rate must be in (0, 1), got {}",
+                    br
+                )));
+            }
+        }
+        Ok(Self {
+            inner: RefCell::new(BayesianProbabilityTransform::new(
+                alpha.unwrap_or(1.0),
+                beta.unwrap_or(0.0),
+                base_rate,
+            )),
+        })
+    }
+
+    #[getter]
+    fn alpha(&self) -> f64 {
+        self.inner.borrow().alpha
+    }
+
+    #[getter]
+    fn beta(&self) -> f64 {
+        self.inner.borrow().beta
+    }
+
+    #[getter]
+    fn base_rate(&self) -> Option<f64> {
+        self.inner.borrow().base_rate
+    }
+
+    #[getter]
+    fn averaged_alpha(&self) -> f64 {
+        self.inner.borrow().averaged_alpha()
+    }
+
+    #[getter]
+    fn averaged_beta(&self) -> f64 {
+        self.inner.borrow().averaged_beta()
+    }
+
+    fn likelihood(&self, score: f64) -> f64 {
+        self.inner.borrow().likelihood(score)
+    }
+
+    #[staticmethod]
+    fn tf_prior(tf: f64) -> f64 {
+        BayesianProbabilityTransform::tf_prior(tf)
+    }
+
+    #[staticmethod]
+    fn norm_prior(doc_len_ratio: f64) -> f64 {
+        BayesianProbabilityTransform::norm_prior(doc_len_ratio)
+    }
+
+    #[staticmethod]
+    fn composite_prior(tf: f64, doc_len_ratio: f64) -> f64 {
+        BayesianProbabilityTransform::composite_prior(tf, doc_len_ratio)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (likelihood_val, prior, base_rate=None))]
+    fn posterior(likelihood_val: f64, prior: f64, base_rate: Option<f64>) -> f64 {
+        BayesianProbabilityTransform::posterior(likelihood_val, prior, base_rate)
+    }
+
+    fn score_to_probability(&self, score: f64, tf: f64, doc_len_ratio: f64) -> f64 {
+        self.inner.borrow().score_to_probability(score, tf, doc_len_ratio)
+    }
+
+    #[pyo3(signature = (bm25_upper_bound, p_max=None))]
+    fn wand_upper_bound(&self, bm25_upper_bound: f64, p_max: Option<f64>) -> f64 {
+        self.inner.borrow().wand_upper_bound(bm25_upper_bound, p_max.unwrap_or(0.9))
+    }
+
+    #[pyo3(signature = (scores, labels, learning_rate=None, max_iterations=None, tolerance=None, mode=None, tfs=None, doc_len_ratios=None))]
+    fn fit(
+        &self,
+        scores: Vec<f64>,
+        labels: Vec<f64>,
+        learning_rate: Option<f64>,
+        max_iterations: Option<usize>,
+        tolerance: Option<f64>,
+        mode: Option<&str>,
+        tfs: Option<Vec<f64>>,
+        doc_len_ratios: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let m = parse_training_mode(mode)?;
+        self.inner.borrow_mut().fit(
+            &scores,
+            &labels,
+            learning_rate.unwrap_or(0.01),
+            max_iterations.unwrap_or(1000),
+            tolerance.unwrap_or(1e-6),
+            m,
+            tfs.as_deref(),
+            doc_len_ratios.as_deref(),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (score, label, learning_rate=None, momentum=None, decay_tau=None, max_grad_norm=None, avg_decay=None, mode=None, tf=None, doc_len_ratio=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &self,
+        score: Vec<f64>,
+        label: Vec<f64>,
+        learning_rate: Option<f64>,
+        momentum: Option<f64>,
+        decay_tau: Option<f64>,
+        max_grad_norm: Option<f64>,
+        avg_decay: Option<f64>,
+        mode: Option<&str>,
+        tf: Option<Vec<f64>>,
+        doc_len_ratio: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let m = if mode.is_some() {
+            Some(parse_training_mode(mode)?)
+        } else {
+            None
+        };
+        self.inner.borrow_mut().update(
+            &score,
+            &label,
+            learning_rate.unwrap_or(0.01),
+            momentum.unwrap_or(0.9),
+            decay_tau.unwrap_or(1000.0),
+            max_grad_norm.unwrap_or(1.0),
+            avg_decay.unwrap_or(0.995),
+            m,
+            tf.as_deref(),
+            doc_len_ratio.as_deref(),
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LearnableLogOddsWeights
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "LearnableLogOddsWeights")]
+pub struct PyLearnableLogOddsWeights {
+    inner: RefCell<LearnableLogOddsWeights>,
+}
+
+#[pymethods]
+impl PyLearnableLogOddsWeights {
+    #[new]
+    #[pyo3(signature = (n_signals, alpha=None))]
+    fn new(n_signals: usize, alpha: Option<f64>) -> PyResult<Self> {
+        if n_signals < 1 {
+            return Err(PyValueError::new_err(format!(
+                "n_signals must be >= 1, got {}",
+                n_signals
+            )));
+        }
+        Ok(Self {
+            inner: RefCell::new(LearnableLogOddsWeights::new(
+                n_signals,
+                alpha.unwrap_or(0.0),
+            )),
+        })
+    }
+
+    #[getter]
+    fn n_signals(&self) -> usize {
+        self.inner.borrow().n_signals()
+    }
+
+    #[getter]
+    fn alpha(&self) -> f64 {
+        self.inner.borrow().alpha()
+    }
+
+    #[getter]
+    fn weights(&self) -> Vec<f64> {
+        self.inner.borrow().weights()
+    }
+
+    #[getter]
+    fn averaged_weights(&self) -> Vec<f64> {
+        self.inner.borrow().averaged_weights()
+    }
+
+    #[pyo3(signature = (probs, use_averaged=None))]
+    fn combine(&self, probs: Vec<f64>, use_averaged: Option<bool>) -> f64 {
+        self.inner.borrow().combine(&probs, use_averaged.unwrap_or(false))
+    }
+
+    #[pyo3(signature = (probs, labels, learning_rate=None, max_iterations=None, tolerance=None))]
+    fn fit(
+        &self,
+        probs: Vec<Vec<f64>>,
+        labels: Vec<f64>,
+        learning_rate: Option<f64>,
+        max_iterations: Option<usize>,
+        tolerance: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().fit(
+            &probs,
+            &labels,
+            learning_rate.unwrap_or(0.01),
+            max_iterations.unwrap_or(1000),
+            tolerance.unwrap_or(1e-6),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (probs, label, learning_rate=None, momentum=None, decay_tau=None, max_grad_norm=None, avg_decay=None))]
+    fn update(
+        &self,
+        probs: Vec<Vec<f64>>,
+        label: Vec<f64>,
+        learning_rate: Option<f64>,
+        momentum: Option<f64>,
+        decay_tau: Option<f64>,
+        max_grad_norm: Option<f64>,
+        avg_decay: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().update(
+            &probs,
+            &label,
+            learning_rate.unwrap_or(0.01),
+            momentum.unwrap_or(0.9),
+            decay_tau.unwrap_or(1000.0),
+            max_grad_norm.unwrap_or(1.0),
+            avg_decay.unwrap_or(0.995),
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AttentionLogOddsWeights
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "AttentionLogOddsWeights")]
+pub struct PyAttentionLogOddsWeights {
+    inner: RefCell<AttentionLogOddsWeights>,
+}
+
+#[pymethods]
+impl PyAttentionLogOddsWeights {
+    #[new]
+    #[pyo3(signature = (n_signals, n_query_features, alpha=None, normalize=None))]
+    fn new(
+        n_signals: usize,
+        n_query_features: usize,
+        alpha: Option<f64>,
+        normalize: Option<bool>,
+    ) -> PyResult<Self> {
+        if n_signals < 1 {
+            return Err(PyValueError::new_err(format!(
+                "n_signals must be >= 1, got {}",
+                n_signals
+            )));
+        }
+        if n_query_features < 1 {
+            return Err(PyValueError::new_err(format!(
+                "n_query_features must be >= 1, got {}",
+                n_query_features
+            )));
+        }
+        Ok(Self {
+            inner: RefCell::new(AttentionLogOddsWeights::new(
+                n_signals,
+                n_query_features,
+                alpha.unwrap_or(0.5),
+                normalize.unwrap_or(false),
+            )),
+        })
+    }
+
+    #[getter]
+    fn n_signals(&self) -> usize {
+        self.inner.borrow().n_signals()
+    }
+
+    #[getter]
+    fn n_query_features(&self) -> usize {
+        self.inner.borrow().n_query_features()
+    }
+
+    #[getter]
+    fn alpha(&self) -> f64 {
+        self.inner.borrow().alpha()
+    }
+
+    #[getter]
+    fn normalize(&self) -> bool {
+        self.inner.borrow().normalize()
+    }
+
+    #[getter]
+    fn weights_matrix(&self) -> Vec<f64> {
+        self.inner.borrow().weights_matrix()
+    }
+
+    #[pyo3(signature = (probs, m, query_features, m_q, use_averaged=None))]
+    fn combine(
+        &self,
+        probs: Vec<f64>,
+        m: usize,
+        query_features: Vec<f64>,
+        m_q: usize,
+        use_averaged: Option<bool>,
+    ) -> Vec<f64> {
+        self.inner.borrow().combine(
+            &probs,
+            m,
+            &query_features,
+            m_q,
+            use_averaged.unwrap_or(false),
+        )
+    }
+
+    #[pyo3(signature = (probs, labels, query_features, m, query_ids=None, learning_rate=None, max_iterations=None, tolerance=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit(
+        &self,
+        probs: Vec<f64>,
+        labels: Vec<f64>,
+        query_features: Vec<f64>,
+        m: usize,
+        query_ids: Option<Vec<usize>>,
+        learning_rate: Option<f64>,
+        max_iterations: Option<usize>,
+        tolerance: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().fit(
+            &probs,
+            &labels,
+            &query_features,
+            m,
+            query_ids.as_deref(),
+            learning_rate.unwrap_or(0.01),
+            max_iterations.unwrap_or(1000),
+            tolerance.unwrap_or(1e-6),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (probs, labels, query_features, m, learning_rate=None, momentum=None, decay_tau=None, max_grad_norm=None, avg_decay=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &self,
+        probs: Vec<f64>,
+        labels: Vec<f64>,
+        query_features: Vec<f64>,
+        m: usize,
+        learning_rate: Option<f64>,
+        momentum: Option<f64>,
+        decay_tau: Option<f64>,
+        max_grad_norm: Option<f64>,
+        avg_decay: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().update(
+            &probs,
+            &labels,
+            &query_features,
+            m,
+            learning_rate.unwrap_or(0.01),
+            momentum.unwrap_or(0.9),
+            decay_tau.unwrap_or(1000.0),
+            max_grad_norm.unwrap_or(1.0),
+            avg_decay.unwrap_or(0.995),
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calibration Metrics
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "CalibrationReport")]
+pub struct PyCalibrationReport {
+    #[pyo3(get)]
+    ece: f64,
+    #[pyo3(get)]
+    brier: f64,
+    #[pyo3(get)]
+    reliability: Vec<(f64, f64, usize)>,
+    #[pyo3(get)]
+    n_samples: usize,
+    #[pyo3(get)]
+    n_bins: usize,
+}
+
+#[pymethods]
+impl PyCalibrationReport {
+    fn summary(&self) -> String {
+        let report = metrics::CalibrationReport {
+            ece: self.ece,
+            brier: self.brier,
+            reliability: self.reliability.clone(),
+            n_samples: self.n_samples,
+            n_bins: self.n_bins,
+        };
+        report.summary()
+    }
+}
+
+#[pyfunction(name = "expected_calibration_error")]
+#[pyo3(signature = (probabilities, labels, n_bins=None))]
+fn expected_calibration_error_py(
+    probabilities: Vec<f64>,
+    labels: Vec<f64>,
+    n_bins: Option<usize>,
+) -> f64 {
+    metrics::expected_calibration_error(&probabilities, &labels, n_bins.unwrap_or(10))
+}
+
+#[pyfunction(name = "brier_score")]
+fn brier_score_py(probabilities: Vec<f64>, labels: Vec<f64>) -> f64 {
+    metrics::brier_score(&probabilities, &labels)
+}
+
+#[pyfunction(name = "reliability_diagram")]
+#[pyo3(signature = (probabilities, labels, n_bins=None))]
+fn reliability_diagram_py(
+    probabilities: Vec<f64>,
+    labels: Vec<f64>,
+    n_bins: Option<usize>,
+) -> Vec<(f64, f64, usize)> {
+    metrics::reliability_diagram(&probabilities, &labels, n_bins.unwrap_or(10))
+}
+
+#[pyfunction(name = "calibration_report")]
+#[pyo3(signature = (probabilities, labels, n_bins=None))]
+fn calibration_report_py(
+    probabilities: Vec<f64>,
+    labels: Vec<f64>,
+    n_bins: Option<usize>,
+) -> PyCalibrationReport {
+    let r = metrics::calibration_report(&probabilities, &labels, n_bins.unwrap_or(10));
+    PyCalibrationReport {
+        ece: r.ece,
+        brier: r.brier,
+        reliability: r.reliability,
+        n_samples: r.n_samples,
+        n_bins: r.n_bins,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FusionDebugger
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "BM25SignalTrace")]
+pub struct PyBM25SignalTrace {
+    #[pyo3(get)]
+    raw_score: f64,
+    #[pyo3(get)]
+    tf: f64,
+    #[pyo3(get)]
+    doc_len_ratio: f64,
+    #[pyo3(get)]
+    likelihood: f64,
+    #[pyo3(get)]
+    tf_prior: f64,
+    #[pyo3(get)]
+    norm_prior: f64,
+    #[pyo3(get)]
+    composite_prior: f64,
+    #[pyo3(get)]
+    logit_likelihood: f64,
+    #[pyo3(get)]
+    logit_prior: f64,
+    #[pyo3(get)]
+    logit_base_rate: Option<f64>,
+    #[pyo3(get)]
+    posterior: f64,
+    #[pyo3(get)]
+    alpha: f64,
+    #[pyo3(get)]
+    beta: f64,
+    #[pyo3(get)]
+    base_rate: Option<f64>,
+}
+
+impl PyBM25SignalTrace {
+    fn from_core(t: &BM25SignalTrace) -> Self {
+        Self {
+            raw_score: t.raw_score,
+            tf: t.tf,
+            doc_len_ratio: t.doc_len_ratio,
+            likelihood: t.likelihood,
+            tf_prior: t.tf_prior,
+            norm_prior: t.norm_prior,
+            composite_prior: t.composite_prior,
+            logit_likelihood: t.logit_likelihood,
+            logit_prior: t.logit_prior,
+            logit_base_rate: t.logit_base_rate,
+            posterior: t.posterior,
+            alpha: t.alpha,
+            beta: t.beta,
+            base_rate: t.base_rate,
+        }
+    }
+}
+
+#[pyclass(name = "VectorSignalTrace")]
+pub struct PyVectorSignalTrace {
+    #[pyo3(get)]
+    cosine_score: f64,
+    #[pyo3(get)]
+    probability: f64,
+    #[pyo3(get)]
+    logit_probability: f64,
+}
+
+impl PyVectorSignalTrace {
+    fn from_core(t: &VectorSignalTrace) -> Self {
+        Self {
+            cosine_score: t.cosine_score,
+            probability: t.probability,
+            logit_probability: t.logit_probability,
+        }
+    }
+}
+
+#[pyclass(name = "NotTrace")]
+pub struct PyNotTrace {
+    #[pyo3(get)]
+    input_probability: f64,
+    #[pyo3(get)]
+    input_name: String,
+    #[pyo3(get)]
+    complement: f64,
+    #[pyo3(get)]
+    logit_input: f64,
+    #[pyo3(get)]
+    logit_complement: f64,
+}
+
+impl PyNotTrace {
+    fn from_core(t: &NotTrace) -> Self {
+        Self {
+            input_probability: t.input_probability,
+            input_name: t.input_name.clone(),
+            complement: t.complement,
+            logit_input: t.logit_input,
+            logit_complement: t.logit_complement,
+        }
+    }
+}
+
+#[pyclass(name = "FusionTrace")]
+pub struct PyFusionTrace {
+    #[pyo3(get)]
+    signal_probabilities: Vec<f64>,
+    #[pyo3(get)]
+    signal_names: Vec<String>,
+    #[pyo3(get)]
+    method: String,
+    #[pyo3(get)]
+    logits: Option<Vec<f64>>,
+    #[pyo3(get)]
+    mean_logit: Option<f64>,
+    #[pyo3(get)]
+    alpha: Option<f64>,
+    #[pyo3(get)]
+    n_alpha_scale: Option<f64>,
+    #[pyo3(get)]
+    scaled_logit: Option<f64>,
+    #[pyo3(get)]
+    weights: Option<Vec<f64>>,
+    #[pyo3(get)]
+    log_probs: Option<Vec<f64>>,
+    #[pyo3(get)]
+    log_prob_sum: Option<f64>,
+    #[pyo3(get)]
+    complements: Option<Vec<f64>>,
+    #[pyo3(get)]
+    log_complements: Option<Vec<f64>>,
+    #[pyo3(get)]
+    log_complement_sum: Option<f64>,
+    #[pyo3(get)]
+    fused_probability: f64,
+}
+
+impl PyFusionTrace {
+    fn from_core(t: &FusionTrace) -> Self {
+        Self {
+            signal_probabilities: t.signal_probabilities.clone(),
+            signal_names: t.signal_names.clone(),
+            method: t.method.clone(),
+            logits: t.logits.clone(),
+            mean_logit: t.mean_logit,
+            alpha: t.alpha,
+            n_alpha_scale: t.n_alpha_scale,
+            scaled_logit: t.scaled_logit,
+            weights: t.weights.clone(),
+            log_probs: t.log_probs.clone(),
+            log_prob_sum: t.log_prob_sum,
+            complements: t.complements.clone(),
+            log_complements: t.log_complements.clone(),
+            log_complement_sum: t.log_complement_sum,
+            fused_probability: t.fused_probability,
+        }
+    }
+}
+
+#[pyclass(name = "DocumentTrace")]
+pub struct PyDocumentTrace {
+    inner: DocumentTrace,
+}
+
+#[pymethods]
+impl PyDocumentTrace {
+    #[getter]
+    fn doc_id(&self) -> Option<String> {
+        self.inner.doc_id.clone()
+    }
+
+    #[getter]
+    fn final_probability(&self) -> f64 {
+        self.inner.final_probability
+    }
+
+    #[getter]
+    fn fusion(&self) -> PyFusionTrace {
+        PyFusionTrace::from_core(&self.inner.fusion)
+    }
+}
+
+#[pyclass(name = "ComparisonResult")]
+pub struct PyComparisonResult {
+    inner: ComparisonResult,
+}
+
+#[pymethods]
+impl PyComparisonResult {
+    #[getter]
+    fn signal_deltas(&self) -> Vec<(String, f64)> {
+        self.inner.signal_deltas.clone()
+    }
+
+    #[getter]
+    fn dominant_signal(&self) -> String {
+        self.inner.dominant_signal.clone()
+    }
+
+    #[getter]
+    fn crossover_stage(&self) -> Option<String> {
+        self.inner.crossover_stage.clone()
+    }
+}
+
+#[pyclass(name = "FusionDebugger")]
+pub struct PyFusionDebugger {
+    inner: FusionDebugger,
+}
+
+#[pymethods]
+impl PyFusionDebugger {
+    #[new]
+    #[pyo3(signature = (alpha=None, beta=None, base_rate=None))]
+    fn new(alpha: Option<f64>, beta: Option<f64>, base_rate: Option<f64>) -> PyResult<Self> {
+        if let Some(br) = base_rate {
+            if br <= 0.0 || br >= 1.0 {
+                return Err(PyValueError::new_err(format!(
+                    "base_rate must be in (0, 1), got {}",
+                    br
+                )));
+            }
+        }
+        let transform = BayesianProbabilityTransform::new(
+            alpha.unwrap_or(1.0),
+            beta.unwrap_or(0.0),
+            base_rate,
+        );
+        Ok(Self {
+            inner: FusionDebugger::new(transform),
+        })
+    }
+
+    fn trace_bm25(&self, score: f64, tf: f64, doc_len_ratio: f64) -> PyBM25SignalTrace {
+        PyBM25SignalTrace::from_core(&self.inner.trace_bm25(score, tf, doc_len_ratio))
+    }
+
+    fn trace_vector(&self, cosine_score: f64) -> PyVectorSignalTrace {
+        PyVectorSignalTrace::from_core(&self.inner.trace_vector(cosine_score))
+    }
+
+    #[pyo3(signature = (probability, name=None))]
+    fn trace_not(&self, probability: f64, name: Option<&str>) -> PyNotTrace {
+        PyNotTrace::from_core(&self.inner.trace_not(probability, name.unwrap_or("signal")))
+    }
+
+    #[pyo3(signature = (probabilities, names=None, method=None, alpha=None, weights=None))]
+    fn trace_fusion(
+        &self,
+        probabilities: Vec<f64>,
+        names: Option<Vec<String>>,
+        method: Option<&str>,
+        alpha: Option<f64>,
+        weights: Option<Vec<f64>>,
+    ) -> PyFusionTrace {
+        let trace = self.inner.trace_fusion(
+            &probabilities,
+            names.as_deref(),
+            method.unwrap_or("log_odds"),
+            alpha,
+            weights.as_deref(),
+        );
+        PyFusionTrace::from_core(&trace)
+    }
+
+    #[pyo3(signature = (bm25_score=None, tf=None, doc_len_ratio=None, cosine_score=None, method=None, alpha=None, weights=None, doc_id=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn trace_document(
+        &self,
+        bm25_score: Option<f64>,
+        tf: Option<f64>,
+        doc_len_ratio: Option<f64>,
+        cosine_score: Option<f64>,
+        method: Option<&str>,
+        alpha: Option<f64>,
+        weights: Option<Vec<f64>>,
+        doc_id: Option<&str>,
+    ) -> PyResult<PyDocumentTrace> {
+        if bm25_score.is_none() && cosine_score.is_none() {
+            return Err(PyValueError::new_err(
+                "At least one of bm25_score or cosine_score must be provided",
+            ));
+        }
+        let trace = self.inner.trace_document(
+            bm25_score,
+            tf,
+            doc_len_ratio,
+            cosine_score,
+            method.unwrap_or("log_odds"),
+            alpha,
+            weights.as_deref(),
+            doc_id,
+        );
+        Ok(PyDocumentTrace { inner: trace })
+    }
+
+    fn compare(&self, trace_a: &PyDocumentTrace, trace_b: &PyDocumentTrace) -> PyComparisonResult {
+        let result = self.inner.compare(&trace_a.inner, &trace_b.inner);
+        PyComparisonResult { inner: result }
+    }
+
+    #[pyo3(signature = (trace, verbose=None))]
+    fn format_trace(&self, trace: &PyDocumentTrace, verbose: Option<bool>) -> String {
+        self.inner.format_trace(&trace.inner, verbose.unwrap_or(true))
+    }
+
+    fn format_summary(&self, trace: &PyDocumentTrace) -> String {
+        self.inner.format_summary(&trace.inner)
+    }
+
+    fn format_comparison(&self, comparison: &PyComparisonResult) -> String {
+        self.inner.format_comparison(&comparison.inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 #[pyfunction(name = "run_experiments")]
 fn run_experiments_py() -> Vec<PyExperimentResult> {
     let corpus = Rc::new(build_default_corpus());
@@ -610,6 +1420,7 @@ fn run_experiments_py() -> Vec<PyExperimentResult> {
 
 #[pymodule]
 fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Core types
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyDocument>()?;
     m.add_class::<PyCorpus>()?;
@@ -623,6 +1434,26 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExperimentResult>()?;
     m.add_class::<PyExperimentRunner>()?;
 
+    // Probability transform
+    m.add_class::<PyBayesianProbabilityTransform>()?;
+
+    // Learnable weights
+    m.add_class::<PyLearnableLogOddsWeights>()?;
+    m.add_class::<PyAttentionLogOddsWeights>()?;
+
+    // Calibration metrics
+    m.add_class::<PyCalibrationReport>()?;
+
+    // Debug/trace types
+    m.add_class::<PyBM25SignalTrace>()?;
+    m.add_class::<PyVectorSignalTrace>()?;
+    m.add_class::<PyNotTrace>()?;
+    m.add_class::<PyFusionTrace>()?;
+    m.add_class::<PyDocumentTrace>()?;
+    m.add_class::<PyComparisonResult>()?;
+    m.add_class::<PyFusionDebugger>()?;
+
+    // Functions
     m.add_function(wrap_pyfunction!(build_default_corpus_py, m)?)?;
     m.add_function(wrap_pyfunction!(build_default_queries_py, m)?)?;
     m.add_function(wrap_pyfunction!(run_experiments_py, m)?)?;
@@ -632,8 +1463,13 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cosine_to_probability_py, m)?)?;
     m.add_function(wrap_pyfunction!(log_odds_conjunction_py, m)?)?;
     m.add_function(wrap_pyfunction!(balanced_log_odds_fusion_py, m)?)?;
+    m.add_function(wrap_pyfunction!(expected_calibration_error_py, m)?)?;
+    m.add_function(wrap_pyfunction!(brier_score_py, m)?)?;
+    m.add_function(wrap_pyfunction!(reliability_diagram_py, m)?)?;
+    m.add_function(wrap_pyfunction!(calibration_report_py, m)?)?;
 
     m.add("__all__", vec![
+        // Core types
         "Tokenizer",
         "Document",
         "Corpus",
@@ -646,6 +1482,22 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "Query",
         "ExperimentResult",
         "ExperimentRunner",
+        // Probability transform
+        "BayesianProbabilityTransform",
+        // Learnable weights
+        "LearnableLogOddsWeights",
+        "AttentionLogOddsWeights",
+        // Calibration
+        "CalibrationReport",
+        // Debug
+        "BM25SignalTrace",
+        "VectorSignalTrace",
+        "NotTrace",
+        "FusionTrace",
+        "DocumentTrace",
+        "ComparisonResult",
+        "FusionDebugger",
+        // Functions
         "build_default_corpus",
         "build_default_queries",
         "run_experiments",
@@ -655,6 +1507,10 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "cosine_to_probability",
         "log_odds_conjunction",
         "balanced_log_odds_fusion",
+        "expected_calibration_error",
+        "brier_score",
+        "reliability_diagram",
+        "calibration_report",
     ])?;
 
     Ok(())

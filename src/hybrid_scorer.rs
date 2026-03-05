@@ -18,7 +18,7 @@ impl HybridScorer {
     }
 
     pub fn probabilistic_and(&self, probs: &[f64]) -> f64 {
-        fusion::log_odds_conjunction(probs, Some(self.alpha), None)
+        fusion::log_odds_conjunction(probs, Some(self.alpha), None, fusion::Gating::NoGating)
     }
 
     pub fn probabilistic_or(&self, probs: &[f64]) -> f64 {

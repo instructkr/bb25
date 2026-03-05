@@ -9,6 +9,11 @@ pub mod fusion;
 pub mod parameter_learner;
 pub mod experiments;
 pub mod defaults;
+pub mod probability;
+pub mod learnable_weights;
+pub mod attention_weights;
+pub mod metrics;
+pub mod debug;
 
 #[cfg(feature = "python")]
 mod pybindings;
@@ -18,9 +23,12 @@ pub use math_utils::{
     cosine_similarity,
     dot_product,
     logit,
+    min_max_normalize,
     safe_log,
     safe_prob,
     sigmoid,
+    softmax,
+    softmax_rows,
     vector_magnitude,
     EPSILON,
 };
@@ -32,6 +40,7 @@ pub use fusion::{
     prob_and,
     prob_not,
     prob_or,
+    Gating,
 };
 
 pub use tokenizer::Tokenizer;
@@ -43,3 +52,23 @@ pub use hybrid_scorer::HybridScorer;
 pub use parameter_learner::{ParameterLearner, ParameterLearnerResult};
 pub use experiments::{ExperimentRunner, Query};
 pub use defaults::{build_default_corpus, build_default_queries};
+pub use probability::{BayesianProbabilityTransform, TrainingMode};
+pub use learnable_weights::LearnableLogOddsWeights;
+pub use attention_weights::AttentionLogOddsWeights;
+pub use metrics::{
+    brier_score,
+    calibration_report,
+    expected_calibration_error,
+    reliability_diagram,
+    CalibrationReport,
+};
+pub use debug::{
+    BM25SignalTrace,
+    ComparisonResult,
+    DocumentTrace,
+    FusionDebugger,
+    FusionTrace,
+    NotTrace,
+    SignalTrace,
+    VectorSignalTrace,
+};

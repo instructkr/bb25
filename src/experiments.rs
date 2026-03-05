@@ -753,29 +753,29 @@ impl ExperimentRunner {
         let mut violations: Vec<String> = Vec::new();
 
         // Agreement amplification: conj([0.9, 0.9]) > 0.9
-        let result = fusion::log_odds_conjunction(&[0.9, 0.9], None, None);
+        let result = fusion::log_odds_conjunction(&[0.9, 0.9], None, None, fusion::Gating::NoGating);
         if result <= 0.9 {
             passed = false;
             violations.push(format!("agreement: conj([0.9,0.9])={:.6} <= 0.9", result));
         }
 
         // Disagreement moderation: conj([0.9, 0.1]) should be near 0.5
-        let result = fusion::log_odds_conjunction(&[0.9, 0.1], None, None);
+        let result = fusion::log_odds_conjunction(&[0.9, 0.1], None, None, fusion::Gating::NoGating);
         if (result - 0.5).abs() > 0.15 {
             passed = false;
             violations.push(format!("disagreement: conj([0.9,0.1])={:.6} not near 0.5", result));
         }
 
         // Neutral identity: conj([0.5, 0.5]) = 0.5
-        let result = fusion::log_odds_conjunction(&[0.5, 0.5], None, None);
+        let result = fusion::log_odds_conjunction(&[0.5, 0.5], None, None, fusion::Gating::NoGating);
         if (result - 0.5).abs() > EPSILON {
             passed = false;
             violations.push(format!("neutral: conj([0.5,0.5])={:.6} != 0.5", result));
         }
 
         // More signals amplify: conj([0.8]*3) > conj([0.8]*2)
-        let conj2 = fusion::log_odds_conjunction(&[0.8, 0.8], None, None);
-        let conj3 = fusion::log_odds_conjunction(&[0.8, 0.8, 0.8], None, None);
+        let conj2 = fusion::log_odds_conjunction(&[0.8, 0.8], None, None, fusion::Gating::NoGating);
+        let conj3 = fusion::log_odds_conjunction(&[0.8, 0.8, 0.8], None, None, fusion::Gating::NoGating);
         if conj3 <= conj2 {
             passed = false;
             violations.push(format!(
@@ -785,8 +785,8 @@ impl ExperimentRunner {
         }
 
         // Alpha effect: higher alpha = stronger amplification
-        let low_alpha = fusion::log_odds_conjunction(&[0.8, 0.8], Some(0.3), None);
-        let high_alpha = fusion::log_odds_conjunction(&[0.8, 0.8], Some(0.8), None);
+        let low_alpha = fusion::log_odds_conjunction(&[0.8, 0.8], Some(0.3), None, fusion::Gating::NoGating);
+        let high_alpha = fusion::log_odds_conjunction(&[0.8, 0.8], Some(0.8), None, fusion::Gating::NoGating);
         if high_alpha <= low_alpha {
             passed = false;
             violations.push(format!(
@@ -798,8 +798,8 @@ impl ExperimentRunner {
         // Weighted with uniform weights + alpha=0 matches unweighted alpha=0
         let uniform_w = vec![0.5, 0.5];
         let probs = [0.7, 0.8];
-        let weighted = fusion::log_odds_conjunction(&probs, Some(0.0), Some(&uniform_w));
-        let unweighted = fusion::log_odds_conjunction(&probs, Some(0.0), None);
+        let weighted = fusion::log_odds_conjunction(&probs, Some(0.0), Some(&uniform_w), fusion::Gating::NoGating);
+        let unweighted = fusion::log_odds_conjunction(&probs, Some(0.0), None, fusion::Gating::NoGating);
         if (weighted - unweighted).abs() > 1e-6 {
             passed = false;
             violations.push(format!(
