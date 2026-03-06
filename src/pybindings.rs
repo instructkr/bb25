@@ -150,6 +150,7 @@ impl PyCorpus {
 #[pymethods]
 impl PyCorpus {
     #[new]
+    #[pyo3(signature = (_tokenizer=None))]
     fn new(_tokenizer: Option<&PyTokenizer>) -> Self {
         let core = CoreCorpus::new(Tokenizer::new());
         Self {
@@ -233,6 +234,7 @@ pub struct PyBM25Scorer {
 #[pymethods]
 impl PyBM25Scorer {
     #[new]
+    #[pyo3(signature = (corpus, k1=None, b=None))]
     fn new(corpus: &PyCorpus, k1: Option<f64>, b: Option<f64>) -> PyResult<Self> {
         let corpus = corpus.shared_corpus()?;
         Ok(Self {
@@ -394,6 +396,7 @@ pub struct PyParameterLearner {
 #[pymethods]
 impl PyParameterLearner {
     #[new]
+    #[pyo3(signature = (learning_rate=None, max_iterations=None, tolerance=None))]
     fn new(learning_rate: Option<f64>, max_iterations: Option<usize>, tolerance: Option<f64>) -> Self {
         Self {
             inner: ParameterLearner::new(
@@ -503,6 +506,7 @@ pub struct PyExperimentRunner {
 #[pymethods]
 impl PyExperimentRunner {
     #[new]
+    #[pyo3(signature = (corpus, queries, k1=None, b=None))]
     fn new(corpus: &PyCorpus, queries: Vec<Py<PyQuery>>, k1: Option<f64>, b: Option<f64>) -> PyResult<Self> {
         let corpus = corpus.shared_corpus()?;
         let mut query_list = Vec::with_capacity(queries.len());
