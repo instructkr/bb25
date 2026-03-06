@@ -49,3 +49,46 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     }
     dot_product(a, b) / (mag_a * mag_b)
 }
+
+/// Numerically stable softmax over a 1D slice.
+///
+/// Shifts by max to prevent overflow, then normalizes.
+pub fn softmax(z: &[f64]) -> Vec<f64> {
+    if z.is_empty() {
+        return Vec::new();
+    }
+    let max_z = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exp_z: Vec<f64> = z.iter().map(|&v| (v - max_z).exp()).collect();
+    let sum: f64 = exp_z.iter().sum();
+    exp_z.iter().map(|&e| e / sum).collect()
+}
+
+/// Row-wise softmax over a 2D array stored as a flat slice.
+///
+/// Each row of `n_cols` elements gets an independent softmax.
+pub fn softmax_rows(z: &[f64], n_cols: usize) -> Vec<f64> {
+    let n_rows = z.len() / n_cols;
+    let mut result = vec![0.0; z.len()];
+    for r in 0..n_rows {
+        let start = r * n_cols;
+        let end = start + n_cols;
+        let row = &z[start..end];
+        let sm = softmax(row);
+        result[start..end].copy_from_slice(&sm);
+    }
+    result
+}
+
+/// Min-max normalize a slice to [0, 1]. Returns zeros if range is negligible.
+pub fn min_max_normalize(values: &[f64]) -> Vec<f64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max_val - min_val;
+    if range < 1e-12 {
+        return vec![0.0; values.len()];
+    }
+    values.iter().map(|&v| (v - min_val) / range).collect()
+}

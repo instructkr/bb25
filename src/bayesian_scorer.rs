@@ -2,17 +2,30 @@ use std::rc::Rc;
 
 use crate::bm25_scorer::BM25Scorer;
 use crate::corpus::Document;
-use crate::math_utils::{clamp, safe_log, safe_prob, sigmoid};
+use crate::fusion;
+use crate::math_utils::{clamp, safe_prob, sigmoid};
 
 pub struct BayesianBM25Scorer {
     bm25: Rc<BM25Scorer>,
     alpha: f64,
     beta: f64,
+    base_rate: Option<f64>,
 }
 
 impl BayesianBM25Scorer {
-    pub fn new(bm25: Rc<BM25Scorer>, alpha: f64, beta: f64) -> Self {
-        Self { bm25, alpha, beta }
+    pub fn new(bm25: Rc<BM25Scorer>, alpha: f64, beta: f64, base_rate: Option<f64>) -> Self {
+        if let Some(br) = base_rate {
+            assert!(
+                br > 0.0 && br < 1.0,
+                "base_rate must be in (0, 1), got {}",
+                br
+            );
+        }
+        Self { bm25, alpha, beta, base_rate }
+    }
+
+    pub fn base_rate(&self) -> Option<f64> {
+        self.base_rate
     }
 
     pub fn likelihood(&self, score: f64) -> f64 {
@@ -43,13 +56,29 @@ impl BayesianBM25Scorer {
         clamp(0.7 * p_tf + 0.3 * p_norm, 0.1, 0.9)
     }
 
+    /// Two-step Bayesian posterior update (Remark 4.4.5).
+    ///
+    /// Step 1: Standard Bayes update with likelihood and prior.
+    /// Step 2 (if base_rate is set): Second Bayes update using base_rate as
+    /// a corpus-level prior, adjusting the posterior toward the base rate.
     pub fn posterior(&self, score: f64, prior: f64) -> f64 {
-        let mut lik = self.likelihood(score);
-        lik = safe_prob(lik);
+        let lik = safe_prob(self.likelihood(score));
         let prior = safe_prob(prior);
+
+        // Step 1: standard Bayes update
         let numerator = lik * prior;
         let denominator = numerator + (1.0 - lik) * (1.0 - prior);
-        numerator / denominator
+        let p1 = numerator / denominator;
+
+        // Step 2: base rate adjustment
+        match self.base_rate {
+            Some(br) => {
+                let num2 = p1 * br;
+                let den2 = num2 + (1.0 - p1) * (1.0 - br);
+                num2 / den2
+            }
+            None => p1,
+        }
     }
 
     pub fn score_term(&self, term: &str, doc: &Document) -> f64 {
@@ -63,22 +92,16 @@ impl BayesianBM25Scorer {
     }
 
     pub fn score(&self, query_terms: &[String], doc: &Document) -> f64 {
-        let mut log_complement_sum = 0.0;
-        let mut has_match = false;
+        let posteriors: Vec<f64> = query_terms
+            .iter()
+            .map(|term| self.score_term(term, doc))
+            .filter(|&p| p > 0.0)
+            .collect();
 
-        for term in query_terms {
-            let p = self.score_term(term, doc);
-            if p > 0.0 {
-                has_match = true;
-                let p = safe_prob(p);
-                log_complement_sum += safe_log(1.0 - p);
-            }
-        }
-
-        if !has_match {
+        if posteriors.is_empty() {
             return 0.0;
         }
 
-        1.0 - log_complement_sum.exp()
+        fusion::prob_or(&posteriors)
     }
 }
