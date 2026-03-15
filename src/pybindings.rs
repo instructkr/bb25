@@ -15,19 +15,30 @@ use crate::hybrid_scorer::HybridScorer;
 use crate::parameter_learner::{ParameterLearner, ParameterLearnerResult};
 use crate::tokenizer::Tokenizer;
 use crate::vector_scorer::VectorScorer;
-use crate::probability::BayesianProbabilityTransform;
+use crate::probability::{BayesianProbabilityTransform, TemporalBayesianTransform};
 use crate::learnable_weights::LearnableLogOddsWeights;
 use crate::attention_weights::AttentionLogOddsWeights;
+use crate::multi_head_attention::MultiHeadAttentionLogOddsWeights;
+use crate::calibration::{PlattCalibrator, IsotonicCalibrator};
+use crate::block_max_index::BlockMaxIndex;
 use crate::metrics;
 use crate::debug::{FusionDebugger, BM25SignalTrace, VectorSignalTrace, FusionTrace, DocumentTrace, ComparisonResult, NotTrace};
 
-fn parse_gating(gating: Option<&str>) -> PyResult<fusion::Gating> {
+fn parse_gating(gating: Option<&str>, gating_beta: Option<f64>) -> PyResult<fusion::Gating> {
     match gating {
         None | Some("none") => Ok(fusion::Gating::NoGating),
         Some("relu") => Ok(fusion::Gating::Relu),
-        Some("swish") => Ok(fusion::Gating::Swish),
+        Some("gelu") => Ok(fusion::Gating::Gelu),
+        Some("swish") => {
+            match gating_beta {
+                Some(beta) if (beta - 1.0).abs() > f64::EPSILON => {
+                    Ok(fusion::Gating::GeneralizedSwish(beta))
+                }
+                _ => Ok(fusion::Gating::Swish),
+            }
+        }
         Some(other) => Err(PyValueError::new_err(format!(
-            "gating must be 'none', 'relu', or 'swish', got '{}'",
+            "gating must be 'none', 'relu', 'swish', or 'gelu', got '{}'",
             other
         ))),
     }
@@ -584,12 +595,13 @@ fn cosine_to_probability_py(score: f64) -> f64 {
 }
 
 #[pyfunction(name = "log_odds_conjunction")]
-#[pyo3(signature = (probs, alpha=None, weights=None, gating=None))]
+#[pyo3(signature = (probs, alpha=None, weights=None, gating=None, gating_beta=None))]
 fn log_odds_conjunction_py(
     probs: Vec<f64>,
     alpha: Option<f64>,
     weights: Option<Vec<f64>>,
     gating: Option<&str>,
+    gating_beta: Option<f64>,
 ) -> PyResult<f64> {
     if let Some(ref w) = weights {
         if w.len() != probs.len() {
@@ -604,7 +616,7 @@ fn log_odds_conjunction_py(
             return Err(PyValueError::new_err("weights must sum to 1.0"));
         }
     }
-    let g = parse_gating(gating)?;
+    let g = parse_gating(gating, gating_beta)?;
     Ok(fusion::log_odds_conjunction(
         &probs,
         alpha,
@@ -796,18 +808,27 @@ pub struct PyLearnableLogOddsWeights {
 #[pymethods]
 impl PyLearnableLogOddsWeights {
     #[new]
-    #[pyo3(signature = (n_signals, alpha=None))]
-    fn new(n_signals: usize, alpha: Option<f64>) -> PyResult<Self> {
+    #[pyo3(signature = (n_signals, alpha=None, base_rate=None))]
+    fn new(n_signals: usize, alpha: Option<f64>, base_rate: Option<f64>) -> PyResult<Self> {
         if n_signals < 1 {
             return Err(PyValueError::new_err(format!(
                 "n_signals must be >= 1, got {}",
                 n_signals
             )));
         }
+        if let Some(br) = base_rate {
+            if br <= 0.0 || br >= 1.0 {
+                return Err(PyValueError::new_err(format!(
+                    "base_rate must be in (0, 1), got {}",
+                    br
+                )));
+            }
+        }
         Ok(Self {
             inner: RefCell::new(LearnableLogOddsWeights::new(
                 n_signals,
                 alpha.unwrap_or(0.0),
+                base_rate,
             )),
         })
     }
@@ -820,6 +841,11 @@ impl PyLearnableLogOddsWeights {
     #[getter]
     fn alpha(&self) -> f64 {
         self.inner.borrow().alpha()
+    }
+
+    #[getter]
+    fn base_rate(&self) -> Option<f64> {
+        self.inner.borrow().base_rate()
     }
 
     #[getter]
@@ -892,12 +918,14 @@ pub struct PyAttentionLogOddsWeights {
 #[pymethods]
 impl PyAttentionLogOddsWeights {
     #[new]
-    #[pyo3(signature = (n_signals, n_query_features, alpha=None, normalize=None))]
+    #[pyo3(signature = (n_signals, n_query_features, alpha=None, normalize=None, seed=None, base_rate=None))]
     fn new(
         n_signals: usize,
         n_query_features: usize,
         alpha: Option<f64>,
         normalize: Option<bool>,
+        seed: Option<u64>,
+        base_rate: Option<f64>,
     ) -> PyResult<Self> {
         if n_signals < 1 {
             return Err(PyValueError::new_err(format!(
@@ -911,12 +939,22 @@ impl PyAttentionLogOddsWeights {
                 n_query_features
             )));
         }
+        if let Some(br) = base_rate {
+            if br <= 0.0 || br >= 1.0 {
+                return Err(PyValueError::new_err(format!(
+                    "base_rate must be in (0, 1), got {}",
+                    br
+                )));
+            }
+        }
         Ok(Self {
             inner: RefCell::new(AttentionLogOddsWeights::new(
                 n_signals,
                 n_query_features,
                 alpha.unwrap_or(0.5),
                 normalize.unwrap_or(false),
+                seed.unwrap_or(0),
+                base_rate,
             )),
         })
     }
@@ -939,6 +977,11 @@ impl PyAttentionLogOddsWeights {
     #[getter]
     fn normalize(&self) -> bool {
         self.inner.borrow().normalize()
+    }
+
+    #[getter]
+    fn base_rate(&self) -> Option<f64> {
+        self.inner.borrow().base_rate()
     }
 
     #[getter]
@@ -1016,6 +1059,524 @@ impl PyAttentionLogOddsWeights {
             avg_decay.unwrap_or(0.995),
         );
         Ok(())
+    }
+
+    #[pyo3(signature = (upper_bound_probs, m, query_features, m_q, use_averaged=None))]
+    fn compute_upper_bounds(
+        &self,
+        upper_bound_probs: Vec<f64>,
+        m: usize,
+        query_features: Vec<f64>,
+        m_q: usize,
+        use_averaged: Option<bool>,
+    ) -> Vec<f64> {
+        self.inner.borrow().compute_upper_bounds(
+            &upper_bound_probs,
+            m,
+            &query_features,
+            m_q,
+            use_averaged.unwrap_or(false),
+        )
+    }
+
+    #[pyo3(signature = (probs, m, query_features, m_q, threshold, upper_bound_probs=None, use_averaged=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn prune(
+        &self,
+        probs: Vec<f64>,
+        m: usize,
+        query_features: Vec<f64>,
+        m_q: usize,
+        threshold: f64,
+        upper_bound_probs: Option<Vec<f64>>,
+        use_averaged: Option<bool>,
+    ) -> (Vec<usize>, Vec<f64>) {
+        self.inner.borrow().prune(
+            &probs,
+            m,
+            &query_features,
+            m_q,
+            threshold,
+            upper_bound_probs.as_deref(),
+            use_averaged.unwrap_or(false),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TemporalBayesianTransform
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "TemporalBayesianTransform")]
+pub struct PyTemporalBayesianTransform {
+    inner: RefCell<TemporalBayesianTransform>,
+}
+
+#[pymethods]
+impl PyTemporalBayesianTransform {
+    #[new]
+    #[pyo3(signature = (alpha=None, beta=None, base_rate=None, decay_half_life=None))]
+    fn new(
+        alpha: Option<f64>,
+        beta: Option<f64>,
+        base_rate: Option<f64>,
+        decay_half_life: Option<f64>,
+    ) -> PyResult<Self> {
+        if let Some(br) = base_rate {
+            if br <= 0.0 || br >= 1.0 {
+                return Err(PyValueError::new_err(format!(
+                    "base_rate must be in (0, 1), got {}",
+                    br
+                )));
+            }
+        }
+        let dhl = decay_half_life.unwrap_or(100.0);
+        if dhl <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "decay_half_life must be > 0, got {}",
+                dhl
+            )));
+        }
+        Ok(Self {
+            inner: RefCell::new(TemporalBayesianTransform::new(
+                alpha.unwrap_or(1.0),
+                beta.unwrap_or(0.0),
+                base_rate,
+                dhl,
+            )),
+        })
+    }
+
+    #[getter]
+    fn alpha(&self) -> f64 {
+        self.inner.borrow().transform.alpha
+    }
+
+    #[getter]
+    fn beta(&self) -> f64 {
+        self.inner.borrow().transform.beta
+    }
+
+    #[getter]
+    fn base_rate(&self) -> Option<f64> {
+        self.inner.borrow().transform.base_rate
+    }
+
+    #[getter]
+    fn decay_half_life(&self) -> f64 {
+        self.inner.borrow().decay_half_life()
+    }
+
+    #[getter]
+    fn timestamp(&self) -> usize {
+        self.inner.borrow().timestamp()
+    }
+
+    #[getter]
+    fn averaged_alpha(&self) -> f64 {
+        self.inner.borrow().averaged_alpha()
+    }
+
+    #[getter]
+    fn averaged_beta(&self) -> f64 {
+        self.inner.borrow().averaged_beta()
+    }
+
+    fn likelihood(&self, score: f64) -> f64 {
+        self.inner.borrow().likelihood(score)
+    }
+
+    fn score_to_probability(&self, score: f64, tf: f64, doc_len_ratio: f64) -> f64 {
+        self.inner.borrow().score_to_probability(score, tf, doc_len_ratio)
+    }
+
+    #[pyo3(signature = (bm25_upper_bound, p_max=None))]
+    fn wand_upper_bound(&self, bm25_upper_bound: f64, p_max: Option<f64>) -> f64 {
+        self.inner.borrow().wand_upper_bound(bm25_upper_bound, p_max.unwrap_or(0.9))
+    }
+
+    #[pyo3(signature = (scores, labels, timestamps=None, learning_rate=None, max_iterations=None, tolerance=None, mode=None, tfs=None, doc_len_ratios=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit(
+        &self,
+        scores: Vec<f64>,
+        labels: Vec<f64>,
+        timestamps: Option<Vec<usize>>,
+        learning_rate: Option<f64>,
+        max_iterations: Option<usize>,
+        tolerance: Option<f64>,
+        mode: Option<&str>,
+        tfs: Option<Vec<f64>>,
+        doc_len_ratios: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let m = parse_training_mode(mode)?;
+        self.inner.borrow_mut().fit(
+            &scores,
+            &labels,
+            timestamps.as_deref(),
+            learning_rate.unwrap_or(0.01),
+            max_iterations.unwrap_or(1000),
+            tolerance.unwrap_or(1e-6),
+            m,
+            tfs.as_deref(),
+            doc_len_ratios.as_deref(),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (scores, labels, learning_rate=None, momentum=None, decay_tau=None, max_grad_norm=None, avg_decay=None, mode=None, tfs=None, doc_len_ratios=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &self,
+        scores: Vec<f64>,
+        labels: Vec<f64>,
+        learning_rate: Option<f64>,
+        momentum: Option<f64>,
+        decay_tau: Option<f64>,
+        max_grad_norm: Option<f64>,
+        avg_decay: Option<f64>,
+        mode: Option<&str>,
+        tfs: Option<Vec<f64>>,
+        doc_len_ratios: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        let m = if mode.is_some() {
+            Some(parse_training_mode(mode)?)
+        } else {
+            None
+        };
+        self.inner.borrow_mut().update(
+            &scores,
+            &labels,
+            learning_rate.unwrap_or(0.01),
+            momentum.unwrap_or(0.9),
+            decay_tau.unwrap_or(1000.0),
+            max_grad_norm.unwrap_or(1.0),
+            avg_decay.unwrap_or(0.995),
+            m,
+            tfs.as_deref(),
+            doc_len_ratios.as_deref(),
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PlattCalibrator
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "PlattCalibrator")]
+pub struct PyPlattCalibrator {
+    inner: RefCell<PlattCalibrator>,
+}
+
+#[pymethods]
+impl PyPlattCalibrator {
+    #[new]
+    #[pyo3(signature = (a=None, b=None))]
+    fn new(a: Option<f64>, b: Option<f64>) -> Self {
+        Self {
+            inner: RefCell::new(PlattCalibrator::new(
+                a.unwrap_or(1.0),
+                b.unwrap_or(0.0),
+            )),
+        }
+    }
+
+    #[getter]
+    fn a(&self) -> f64 {
+        self.inner.borrow().a
+    }
+
+    #[getter]
+    fn b(&self) -> f64 {
+        self.inner.borrow().b
+    }
+
+    #[pyo3(signature = (scores, labels, learning_rate=None, max_iterations=None, tolerance=None))]
+    fn fit(
+        &self,
+        scores: Vec<f64>,
+        labels: Vec<f64>,
+        learning_rate: Option<f64>,
+        max_iterations: Option<usize>,
+        tolerance: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().fit(
+            &scores,
+            &labels,
+            learning_rate.unwrap_or(0.01),
+            max_iterations.unwrap_or(1000),
+            tolerance.unwrap_or(1e-6),
+        );
+        Ok(())
+    }
+
+    fn calibrate(&self, scores: Vec<f64>) -> Vec<f64> {
+        self.inner.borrow().calibrate_batch(&scores)
+    }
+
+    fn calibrate_single(&self, score: f64) -> f64 {
+        self.inner.borrow().calibrate(score)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IsotonicCalibrator
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "IsotonicCalibrator")]
+pub struct PyIsotonicCalibrator {
+    inner: RefCell<IsotonicCalibrator>,
+}
+
+#[pymethods]
+impl PyIsotonicCalibrator {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: RefCell::new(IsotonicCalibrator::new()),
+        }
+    }
+
+    fn fit(&self, scores: Vec<f64>, labels: Vec<f64>) -> PyResult<()> {
+        self.inner.borrow_mut().fit(&scores, &labels);
+        Ok(())
+    }
+
+    fn calibrate(&self, scores: Vec<f64>) -> Vec<f64> {
+        self.inner.borrow().calibrate_batch(&scores)
+    }
+
+    fn calibrate_single(&self, score: f64) -> f64 {
+        self.inner.borrow().calibrate(score)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockMaxIndex
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "BlockMaxIndex")]
+pub struct PyBlockMaxIndex {
+    inner: RefCell<BlockMaxIndex>,
+}
+
+#[pymethods]
+impl PyBlockMaxIndex {
+    #[new]
+    #[pyo3(signature = (block_size=None))]
+    fn new(block_size: Option<usize>) -> PyResult<Self> {
+        let bs = block_size.unwrap_or(128);
+        if bs < 1 {
+            return Err(PyValueError::new_err(format!(
+                "block_size must be >= 1, got {}",
+                bs
+            )));
+        }
+        Ok(Self {
+            inner: RefCell::new(BlockMaxIndex::new(bs)),
+        })
+    }
+
+    #[getter]
+    fn block_size(&self) -> usize {
+        self.inner.borrow().block_size()
+    }
+
+    #[getter]
+    fn n_blocks(&self) -> usize {
+        self.inner.borrow().n_blocks()
+    }
+
+    fn build(&self, score_matrix: Vec<Vec<f64>>) {
+        self.inner.borrow_mut().build(&score_matrix);
+    }
+
+    fn block_upper_bound(&self, term_idx: usize, block_id: usize) -> f64 {
+        self.inner.borrow().block_upper_bound(term_idx, block_id)
+    }
+
+    fn bayesian_block_upper_bound(
+        &self,
+        term_idx: usize,
+        block_id: usize,
+        transform: &PyBayesianProbabilityTransform,
+        p_max: f64,
+    ) -> f64 {
+        self.inner.borrow().bayesian_block_upper_bound(
+            term_idx,
+            block_id,
+            &transform.inner.borrow(),
+            p_max,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MultiHeadAttentionLogOddsWeights
+// ---------------------------------------------------------------------------
+
+#[pyclass(unsendable, name = "MultiHeadAttentionLogOddsWeights")]
+pub struct PyMultiHeadAttentionLogOddsWeights {
+    inner: RefCell<MultiHeadAttentionLogOddsWeights>,
+}
+
+#[pymethods]
+impl PyMultiHeadAttentionLogOddsWeights {
+    #[new]
+    #[pyo3(signature = (n_heads, n_signals, n_query_features, alpha=None, normalize=None))]
+    fn new(
+        n_heads: usize,
+        n_signals: usize,
+        n_query_features: usize,
+        alpha: Option<f64>,
+        normalize: Option<bool>,
+    ) -> PyResult<Self> {
+        if n_heads < 1 {
+            return Err(PyValueError::new_err(format!(
+                "n_heads must be >= 1, got {}",
+                n_heads
+            )));
+        }
+        if n_signals < 1 {
+            return Err(PyValueError::new_err(format!(
+                "n_signals must be >= 1, got {}",
+                n_signals
+            )));
+        }
+        if n_query_features < 1 {
+            return Err(PyValueError::new_err(format!(
+                "n_query_features must be >= 1, got {}",
+                n_query_features
+            )));
+        }
+        Ok(Self {
+            inner: RefCell::new(MultiHeadAttentionLogOddsWeights::new(
+                n_heads,
+                n_signals,
+                n_query_features,
+                alpha.unwrap_or(0.5),
+                normalize.unwrap_or(false),
+            )),
+        })
+    }
+
+    #[getter]
+    fn n_heads(&self) -> usize {
+        self.inner.borrow().n_heads()
+    }
+
+    #[pyo3(signature = (probs, m, query_features, m_q, use_averaged=None))]
+    fn combine(
+        &self,
+        probs: Vec<f64>,
+        m: usize,
+        query_features: Vec<f64>,
+        m_q: usize,
+        use_averaged: Option<bool>,
+    ) -> Vec<f64> {
+        self.inner.borrow().combine(
+            &probs,
+            m,
+            &query_features,
+            m_q,
+            use_averaged.unwrap_or(false),
+        )
+    }
+
+    #[pyo3(signature = (probs, labels, query_features, m, query_ids=None, learning_rate=None, max_iterations=None, tolerance=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit(
+        &self,
+        probs: Vec<f64>,
+        labels: Vec<f64>,
+        query_features: Vec<f64>,
+        m: usize,
+        query_ids: Option<Vec<usize>>,
+        learning_rate: Option<f64>,
+        max_iterations: Option<usize>,
+        tolerance: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().fit(
+            &probs,
+            &labels,
+            &query_features,
+            m,
+            query_ids.as_deref(),
+            learning_rate.unwrap_or(0.01),
+            max_iterations.unwrap_or(1000),
+            tolerance.unwrap_or(1e-6),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (probs, labels, query_features, m, learning_rate=None, momentum=None, decay_tau=None, max_grad_norm=None, avg_decay=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &self,
+        probs: Vec<f64>,
+        labels: Vec<f64>,
+        query_features: Vec<f64>,
+        m: usize,
+        learning_rate: Option<f64>,
+        momentum: Option<f64>,
+        decay_tau: Option<f64>,
+        max_grad_norm: Option<f64>,
+        avg_decay: Option<f64>,
+    ) -> PyResult<()> {
+        self.inner.borrow_mut().update(
+            &probs,
+            &labels,
+            &query_features,
+            m,
+            learning_rate.unwrap_or(0.01),
+            momentum.unwrap_or(0.9),
+            decay_tau.unwrap_or(1000.0),
+            max_grad_norm.unwrap_or(1.0),
+            avg_decay.unwrap_or(0.995),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (upper_bound_probs, m, query_features, m_q, use_averaged=None))]
+    fn compute_upper_bounds(
+        &self,
+        upper_bound_probs: Vec<f64>,
+        m: usize,
+        query_features: Vec<f64>,
+        m_q: usize,
+        use_averaged: Option<bool>,
+    ) -> Vec<f64> {
+        self.inner.borrow().compute_upper_bounds(
+            &upper_bound_probs,
+            m,
+            &query_features,
+            m_q,
+            use_averaged.unwrap_or(false),
+        )
+    }
+
+    #[pyo3(signature = (probs, m, query_features, m_q, threshold, upper_bound_probs=None, use_averaged=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn prune(
+        &self,
+        probs: Vec<f64>,
+        m: usize,
+        query_features: Vec<f64>,
+        m_q: usize,
+        threshold: f64,
+        upper_bound_probs: Option<Vec<f64>>,
+        use_averaged: Option<bool>,
+    ) -> (Vec<usize>, Vec<f64>) {
+        self.inner.borrow().prune(
+            &probs,
+            m,
+            &query_features,
+            m_q,
+            threshold,
+            upper_bound_probs.as_deref(),
+            use_averaged.unwrap_or(false),
+        )
     }
 }
 
@@ -1298,7 +1859,7 @@ impl PyComparisonResult {
     }
 }
 
-#[pyclass(name = "FusionDebugger")]
+#[pyclass(unsendable, name = "FusionDebugger")]
 pub struct PyFusionDebugger {
     inner: FusionDebugger,
 }
@@ -1440,10 +2001,19 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Probability transform
     m.add_class::<PyBayesianProbabilityTransform>()?;
+    m.add_class::<PyTemporalBayesianTransform>()?;
 
     // Learnable weights
     m.add_class::<PyLearnableLogOddsWeights>()?;
     m.add_class::<PyAttentionLogOddsWeights>()?;
+    m.add_class::<PyMultiHeadAttentionLogOddsWeights>()?;
+
+    // Calibration
+    m.add_class::<PyPlattCalibrator>()?;
+    m.add_class::<PyIsotonicCalibrator>()?;
+
+    // Block-max index
+    m.add_class::<PyBlockMaxIndex>()?;
 
     // Calibration metrics
     m.add_class::<PyCalibrationReport>()?;
@@ -1488,10 +2058,17 @@ fn bb25(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ExperimentRunner",
         // Probability transform
         "BayesianProbabilityTransform",
+        "TemporalBayesianTransform",
         // Learnable weights
         "LearnableLogOddsWeights",
         "AttentionLogOddsWeights",
+        "MultiHeadAttentionLogOddsWeights",
         // Calibration
+        "PlattCalibrator",
+        "IsotonicCalibrator",
+        // Block-max index
+        "BlockMaxIndex",
+        // Calibration metrics
         "CalibrationReport",
         // Debug
         "BM25SignalTrace",

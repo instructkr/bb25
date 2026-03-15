@@ -16,11 +16,24 @@ pub struct LearnableLogOddsWeights {
     n_updates: usize,
     grad_logits_ema: Vec<f64>,
     weights_avg: Vec<f64>,
+    base_rate: Option<f64>,
+    logit_base_rate: Option<f64>,
 }
 
 impl LearnableLogOddsWeights {
-    pub fn new(n_signals: usize, alpha: f64) -> Self {
+    pub fn new(n_signals: usize, alpha: f64, base_rate: Option<f64>) -> Self {
         assert!(n_signals >= 1, "n_signals must be >= 1, got {}", n_signals);
+        if let Some(br) = base_rate {
+            assert!(
+                br > 0.0 && br < 1.0,
+                "base_rate must be in (0, 1), got {}",
+                br
+            );
+        }
+        let logit_br = base_rate.map(|br| {
+            let br = safe_prob(br);
+            logit(br)
+        });
         let uniform = 1.0 / n_signals as f64;
         Self {
             n_signals,
@@ -29,7 +42,13 @@ impl LearnableLogOddsWeights {
             n_updates: 0,
             grad_logits_ema: vec![0.0; n_signals],
             weights_avg: vec![uniform; n_signals],
+            base_rate,
+            logit_base_rate: logit_br,
         }
+    }
+
+    pub fn base_rate(&self) -> Option<f64> {
+        self.base_rate
     }
 
     pub fn n_signals(&self) -> usize {
@@ -52,12 +71,28 @@ impl LearnableLogOddsWeights {
 
     /// Combine probability signals via weighted log-odds conjunction.
     pub fn combine(&self, probs: &[f64], use_averaged: bool) -> f64 {
-        let w = if use_averaged {
-            self.weights_avg.clone()
+        if let Some(lbr) = self.logit_base_rate {
+            let w = if use_averaged {
+                self.weights_avg.clone()
+            } else {
+                self.weights()
+            };
+            let n = probs.len() as f64;
+            let scale = n.powf(self.alpha);
+            let l_weighted: f64 = w
+                .iter()
+                .zip(probs.iter())
+                .map(|(&wi, &p)| wi * logit(safe_prob(p)))
+                .sum();
+            sigmoid(scale * l_weighted + lbr)
         } else {
-            self.weights()
-        };
-        log_odds_conjunction(probs, Some(self.alpha), Some(&w), Gating::NoGating)
+            let w = if use_averaged {
+                self.weights_avg.clone()
+            } else {
+                self.weights()
+            };
+            log_odds_conjunction(probs, Some(self.alpha), Some(&w), Gating::NoGating)
+        }
     }
 
     /// Batch gradient descent on BCE loss to learn weights.
@@ -91,8 +126,10 @@ impl LearnableLogOddsWeights {
                 // Weighted mean log-odds
                 let x_bar_w: f64 = w.iter().zip(x[i].iter()).map(|(&wj, &xj)| wj * xj).sum();
 
-                // Predicted probability
-                let p = sigmoid(scale * x_bar_w);
+                // Predicted probability (add logit_base_rate if present)
+                let l_weighted = scale * x_bar_w
+                    + self.logit_base_rate.unwrap_or(0.0);
+                let p = sigmoid(l_weighted);
                 let error = p - labels[i];
 
                 // Gradient for each logit z_j
@@ -143,7 +180,9 @@ impl LearnableLogOddsWeights {
             assert_eq!(probs[i].len(), n);
             let x: Vec<f64> = probs[i].iter().map(|&p| logit(safe_prob(p))).collect();
             let x_bar_w: f64 = w.iter().zip(x.iter()).map(|(&wj, &xj)| wj * xj).sum();
-            let p = sigmoid(scale * x_bar_w);
+            let l_weighted = scale * x_bar_w
+                + self.logit_base_rate.unwrap_or(0.0);
+            let p = sigmoid(l_weighted);
             let error = p - labels[i];
 
             for j in 0..n {

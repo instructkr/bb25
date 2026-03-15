@@ -7,10 +7,11 @@ Evaluates ranking quality and probability calibration across:
   3. Bayesian BM25 (batch-fitted params via BayesianProbabilityTransform)
   4. Hybrid OR / AND (when embeddings available)
   5. Balanced log-odds fusion
-  6. Gated log-odds fusion (relu, swish)
+  6. Gated log-odds fusion (relu, swish, gelu)
   7. Learned-weight log-odds fusion (LearnableLogOddsWeights)
   8. Attention-weighted log-odds fusion (AttentionLogOddsWeights)
-  9. Calibration diagnostics (ECE, Brier, reliability diagram)
+  9. Multi-head attention fusion (MultiHeadAttentionLogOddsWeights)
+ 10. Calibration diagnostics (ECE, Brier, reliability diagram)
 """
 
 from __future__ import annotations
@@ -585,6 +586,102 @@ def evaluate_attention_fusion(
     return metrics
 
 
+def evaluate_multi_head_attention_fusion(
+    queries: List[QueryRecord],
+    docs: List[bb.Document],
+    bayes: bb.BayesianBM25Scorer,
+    vector: bb.VectorScorer,
+    qrels: Dict[str, Dict[str, float]],
+    tokenizer: bb.Tokenizer,
+    cutoffs: List[int],
+    n_heads: int = 4,
+) -> Dict[str, float]:
+    """Evaluate MultiHeadAttentionLogOddsWeights fusion."""
+    n_signals = 2
+    n_query_features = 1
+
+    # Phase 1: collect training data
+    train_probs: List[float] = []
+    train_labels: List[float] = []
+    train_features: List[float] = []
+
+    for query in queries:
+        rel_map = qrels.get(query.query_id, {})
+        if not rel_map:
+            continue
+        if query.embedding is None:
+            continue
+        terms = query.terms or tokenizer.tokenize(query.text)
+        qlen = float(len(terms))
+
+        for doc in docs:
+            did = doc.id
+            if did not in rel_map:
+                continue
+            sparse_prob = bayes.score(terms, doc)
+            dense_sim = vector.score(query.embedding, doc)
+            dense_prob = bb.cosine_to_probability(dense_sim)
+            train_probs.extend([sparse_prob, dense_prob])
+            train_labels.append(1.0 if rel_map[did] > 0 else 0.0)
+            train_features.append(qlen)
+
+    if len(train_labels) < 4:
+        return {"scorer": f"multi_head_{n_heads}", "queries": 0, "elapsed_s": 0.0}
+
+    # Phase 2: fit
+    n_samples = len(train_labels)
+    mh = bb.MultiHeadAttentionLogOddsWeights(n_heads, n_signals, n_query_features)
+    mh.fit(train_probs, train_labels, train_features, n_samples)
+
+    # Phase 3: evaluate
+    metrics = {f"map@{k}": 0.0 for k in cutoffs}
+    metrics.update({f"ndcg@{k}": 0.0 for k in cutoffs})
+    metrics.update({f"mrr@{k}": 0.0 for k in cutoffs})
+
+    counted = 0
+    start = time.perf_counter()
+    for query in queries:
+        rel_map = qrels.get(query.query_id, {})
+        if not rel_map:
+            continue
+        if query.embedding is None:
+            continue
+        terms = query.terms or tokenizer.tokenize(query.text)
+        qlen = float(len(terms))
+
+        doc_ids: List[str] = []
+        query_probs: List[float] = []
+        for doc in docs:
+            sparse_prob = bayes.score(terms, doc)
+            dense_sim = vector.score(query.embedding, doc)
+            dense_prob = bb.cosine_to_probability(dense_sim)
+            doc_ids.append(doc.id)
+            query_probs.extend([sparse_prob, dense_prob])
+
+        n_docs_q = len(doc_ids)
+        fused_scores = mh.combine(query_probs, n_docs_q, [qlen], 1, use_averaged=True)
+
+        doc_scores = list(zip(doc_ids, fused_scores))
+        ranked = rank_docs(doc_scores)
+        for k in cutoffs:
+            metrics[f"map@{k}"] += average_precision_at_k(ranked, rel_map, k)
+            metrics[f"ndcg@{k}"] += ndcg_at_k(ranked, rel_map, k)
+            metrics[f"mrr@{k}"] += mrr_at_k(ranked, rel_map, k)
+        counted += 1
+
+    elapsed = time.perf_counter() - start
+    scorer_name = f"multi_head_{n_heads}"
+    if counted == 0:
+        return {"scorer": scorer_name, "queries": 0, "elapsed_s": elapsed}
+
+    for key in list(metrics.keys()):
+        metrics[key] /= counted
+    metrics["scorer"] = scorer_name
+    metrics["queries"] = counted
+    metrics["elapsed_s"] = elapsed
+    return metrics
+
+
 def evaluate_fitted_bayesian(
     queries: List[QueryRecord],
     docs: List[bb.Document],
@@ -845,7 +942,7 @@ def main() -> None:
         )
 
         # Gated fusion variants
-        for gating in ("relu", "swish"):
+        for gating in ("relu", "swish", "gelu"):
             results.append(
                 evaluate_gated_fusion(
                     queries, doc_objs, bayes, vector,
@@ -866,6 +963,14 @@ def main() -> None:
             evaluate_attention_fusion(
                 queries, doc_objs, bayes, vector,
                 qrels, tokenizer, cutoffs,
+            )
+        )
+
+        # Multi-head attention fusion
+        results.append(
+            evaluate_multi_head_attention_fusion(
+                queries, doc_objs, bayes, vector,
+                qrels, tokenizer, cutoffs, n_heads=4,
             )
         )
 
