@@ -2,6 +2,19 @@
 
 This folder provides a lightweight benchmark runner to compare classic BM25 and Bayesian BM25 on your own corpora. It is designed to be simple and reproducible, not fast.
 
+Evaluated scorers:
+
+1. Raw BM25 (baseline)
+2. Bayesian BM25 (fixed params)
+3. Bayesian BM25 (batch-fitted params)
+4. Hybrid OR / AND (when embeddings available)
+5. Balanced log-odds fusion
+6. Gated log-odds fusion (ReLU, Swish, GELU)
+7. Learned-weight log-odds fusion (LearnableLogOddsWeights)
+8. Attention-weighted log-odds fusion (AttentionLogOddsWeights)
+9. Multi-head attention fusion (MultiHeadAttentionLogOddsWeights, 4 heads)
+10. Calibration diagnostics (ECE, Brier, reliability diagram)
+
 ## File formats
 
 ### `docs.jsonl`

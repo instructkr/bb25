@@ -22,17 +22,20 @@ pub struct AttentionLogOddsWeights {
     // Polyak averaging
     w_avg: Vec<f64>,
     b_avg: Vec<f64>,
+    // Base rate
+    base_rate: Option<f64>,
+    logit_base_rate: Option<f64>,
 }
 
 impl AttentionLogOddsWeights {
     /// Create new attention weights with Xavier initialization.
-    ///
-    /// Uses a fixed seed (0) for reproducible initialization.
     pub fn new(
         n_signals: usize,
         n_query_features: usize,
         alpha: f64,
         normalize: bool,
+        seed: u64,
+        base_rate: Option<f64>,
     ) -> Self {
         assert!(n_signals >= 1, "n_signals must be >= 1, got {}", n_signals);
         assert!(
@@ -40,11 +43,23 @@ impl AttentionLogOddsWeights {
             "n_query_features must be >= 1, got {}",
             n_query_features
         );
+        if let Some(br) = base_rate {
+            assert!(
+                br > 0.0 && br < 1.0,
+                "base_rate must be in (0, 1), got {}",
+                br
+            );
+        }
 
-        // Xavier-style initialization using a simple PRNG (same seed as Python's np.random.default_rng(0))
+        let logit_br = base_rate.map(|br| {
+            let br = safe_prob(br);
+            logit(br)
+        });
+
+        // Xavier-style initialization using a simple PRNG
         let scale = 1.0 / (n_query_features as f64).sqrt();
         let total = n_signals * n_query_features;
-        let w_matrix = simple_normal_init(total, scale, 0);
+        let w_matrix = simple_normal_init(total, scale, seed);
 
         Self {
             n_signals,
@@ -58,7 +73,13 @@ impl AttentionLogOddsWeights {
             grad_b_ema: vec![0.0; n_signals],
             w_avg: w_matrix,
             b_avg: vec![0.0; n_signals],
+            base_rate,
+            logit_base_rate: logit_br,
         }
+    }
+
+    pub fn base_rate(&self) -> Option<f64> {
+        self.base_rate
     }
 
     pub fn n_signals(&self) -> usize {
@@ -136,8 +157,19 @@ impl AttentionLogOddsWeights {
         let n = self.n_signals;
         let weights = self.compute_weights(query_features, m_q, use_averaged);
 
+        let lbr = self.logit_base_rate.unwrap_or(0.0);
+
         if m == 1 && !self.normalize {
-            // Single sample: just use weighted log-odds conjunction
+            if self.logit_base_rate.is_some() {
+                let scale = (n as f64).powf(self.alpha);
+                let w_flat: Vec<f64> = (0..n).map(|j| weights[j]).collect();
+                let l_weighted: f64 = w_flat
+                    .iter()
+                    .zip(probs.iter())
+                    .map(|(&wi, &p)| wi * logit(safe_prob(p)))
+                    .sum();
+                return vec![sigmoid(scale * l_weighted + lbr)];
+            }
             let w_flat: Vec<f64> = (0..n).map(|j| weights[j]).collect();
             let row_probs: Vec<f64> = (0..n).map(|j| probs[j]).collect();
             return vec![log_odds_conjunction(&row_probs, Some(self.alpha), Some(&w_flat), Gating::NoGating)];
@@ -155,7 +187,7 @@ impl AttentionLogOddsWeights {
                 for j in 0..n {
                     l_weighted += weights[wi_row * n + j] * x[i * n + j];
                 }
-                results[i] = sigmoid(scale * l_weighted);
+                results[i] = sigmoid(scale * l_weighted + lbr);
             }
             return results;
         }
@@ -164,9 +196,18 @@ impl AttentionLogOddsWeights {
         let mut results = vec![0.0; m];
         for i in 0..m {
             let wi_row = (i).min(m_q - 1);
-            let w_slice: Vec<f64> = (0..n).map(|j| weights[wi_row * n + j]).collect();
-            let row_probs: Vec<f64> = (0..n).map(|j| probs[i * n + j]).collect();
-            results[i] = log_odds_conjunction(&row_probs, Some(self.alpha), Some(&w_slice), Gating::NoGating);
+            if self.logit_base_rate.is_some() {
+                let scale = (n as f64).powf(self.alpha);
+                let mut l_weighted = 0.0;
+                for j in 0..n {
+                    l_weighted += weights[wi_row * n + j] * logit(safe_prob(probs[i * n + j]));
+                }
+                results[i] = sigmoid(scale * l_weighted + lbr);
+            } else {
+                let w_slice: Vec<f64> = (0..n).map(|j| weights[wi_row * n + j]).collect();
+                let row_probs: Vec<f64> = (0..n).map(|j| probs[i * n + j]).collect();
+                results[i] = log_odds_conjunction(&row_probs, Some(self.alpha), Some(&w_slice), Gating::NoGating);
+            }
         }
         results
     }
@@ -231,9 +272,10 @@ impl AttentionLogOddsWeights {
             let mut grad_w = vec![0.0; n * nqf];
             let mut grad_b = vec![0.0; n];
 
+            let lbr = self.logit_base_rate.unwrap_or(0.0);
             for i in 0..m {
                 let x_bar_w: f64 = (0..n).map(|j| w[i * n + j] * x[i * n + j]).sum();
-                let p = sigmoid(scale * x_bar_w);
+                let p = sigmoid(scale * x_bar_w + lbr);
                 let error = p - labels[i];
 
                 // grad_z_j = scale * error * w_j * (x_j - x_bar_w)
@@ -326,9 +368,10 @@ impl AttentionLogOddsWeights {
         let mut grad_w = vec![0.0; n * nqf];
         let mut grad_b = vec![0.0; n];
 
+        let lbr = self.logit_base_rate.unwrap_or(0.0);
         for i in 0..m {
             let x_bar_w: f64 = (0..n).map(|j| w[i * n + j] * x[i * n + j]).sum();
-            let p = sigmoid(scale * x_bar_w);
+            let p = sigmoid(scale * x_bar_w + lbr);
             let error = p - labels[i];
 
             for j in 0..n {
@@ -396,6 +439,87 @@ impl AttentionLogOddsWeights {
         for j in 0..n {
             self.b_avg[j] = avg_decay * self.b_avg[j] + (1.0 - avg_decay) * self.bias[j];
         }
+    }
+
+    /// Compute upper bounds on fused probabilities using per-signal upper bound probs.
+    ///
+    /// upper_bound_probs: flat array of shape (m * n_signals)
+    /// Returns a Vec of length m with upper bound fused probabilities.
+    pub fn compute_upper_bounds(
+        &self,
+        upper_bound_probs: &[f64],
+        m: usize,
+        query_features: &[f64],
+        m_q: usize,
+        use_averaged: bool,
+    ) -> Vec<f64> {
+        let n = self.n_signals;
+        let scale = (n as f64).powf(self.alpha);
+        let weights = self.compute_weights(query_features, m_q, use_averaged);
+        let lbr = self.logit_base_rate.unwrap_or(0.0);
+
+        let mut results = vec![0.0; m];
+        for i in 0..m {
+            let wi_row = (i).min(m_q - 1);
+            let mut l_weighted = 0.0;
+            for j in 0..n {
+                l_weighted += weights[wi_row * n + j] * logit(safe_prob(upper_bound_probs[i * n + j]));
+            }
+            results[i] = sigmoid(scale * l_weighted + lbr);
+        }
+        results
+    }
+
+    /// Prune candidates whose upper bound fused probability is below threshold.
+    ///
+    /// Returns (surviving_indices, fused_probabilities) for candidates that survive pruning.
+    pub fn prune(
+        &self,
+        probs: &[f64],
+        m: usize,
+        query_features: &[f64],
+        m_q: usize,
+        threshold: f64,
+        upper_bound_probs: Option<&[f64]>,
+        use_averaged: bool,
+    ) -> (Vec<usize>, Vec<f64>) {
+        let n = self.n_signals;
+
+        // Compute upper bounds to determine surviving candidates
+        let ub_probs = upper_bound_probs.unwrap_or(probs);
+        let upper_bounds = self.compute_upper_bounds(ub_probs, m, query_features, m_q, use_averaged);
+
+        // Filter by threshold
+        let surviving: Vec<usize> = (0..m)
+            .filter(|&i| upper_bounds[i] >= threshold)
+            .collect();
+
+        // Compute actual fused probabilities for survivors
+        let survivor_m = surviving.len();
+        if survivor_m == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Gather survivor probs into a flat array
+        let mut survivor_probs = vec![0.0; survivor_m * n];
+        for (si, &orig_i) in surviving.iter().enumerate() {
+            for j in 0..n {
+                survivor_probs[si * n + j] = probs[orig_i * n + j];
+            }
+        }
+
+        // Gather survivor query features
+        let nqf = self.n_query_features;
+        let mut survivor_qf = vec![0.0; survivor_m * nqf];
+        for (si, &orig_i) in surviving.iter().enumerate() {
+            let qi = orig_i.min(m_q - 1);
+            for k in 0..nqf {
+                survivor_qf[si * nqf + k] = query_features[qi * nqf + k];
+            }
+        }
+
+        let fused = self.combine(&survivor_probs, survivor_m, &survivor_qf, survivor_m, use_averaged);
+        (surviving, fused)
     }
 }
 

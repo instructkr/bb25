@@ -10,6 +10,10 @@ pub enum Gating {
     Relu,
     /// Bayes estimate under sparse prior (Theorem 6.7.4): logit * sigmoid(logit).
     Swish,
+    /// Generalized Swish: logit * sigmoid(beta * logit) (Theorem 6.7.6).
+    GeneralizedSwish(f64),
+    /// GELU: logit * sigmoid(1.702 * logit) (Theorem 6.8.1).
+    Gelu,
 }
 
 /// Apply gating function to a single logit value.
@@ -18,6 +22,8 @@ fn apply_gating(logit_val: f64, gating: Gating) -> f64 {
         Gating::NoGating => logit_val,
         Gating::Relu => logit_val.max(0.0),
         Gating::Swish => logit_val * sigmoid(logit_val),
+        Gating::GeneralizedSwish(beta) => logit_val * sigmoid(beta * logit_val),
+        Gating::Gelu => logit_val * sigmoid(1.702 * logit_val),
     }
 }
 

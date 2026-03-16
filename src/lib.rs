@@ -12,6 +12,9 @@ pub mod defaults;
 pub mod probability;
 pub mod learnable_weights;
 pub mod attention_weights;
+pub mod multi_head_attention;
+pub mod calibration;
+pub mod block_max_index;
 pub mod metrics;
 pub mod debug;
 
@@ -52,9 +55,12 @@ pub use hybrid_scorer::HybridScorer;
 pub use parameter_learner::{ParameterLearner, ParameterLearnerResult};
 pub use experiments::{ExperimentRunner, Query};
 pub use defaults::{build_default_corpus, build_default_queries};
-pub use probability::{BayesianProbabilityTransform, TrainingMode};
+pub use probability::{BayesianProbabilityTransform, TemporalBayesianTransform, TrainingMode};
 pub use learnable_weights::LearnableLogOddsWeights;
 pub use attention_weights::AttentionLogOddsWeights;
+pub use multi_head_attention::MultiHeadAttentionLogOddsWeights;
+pub use calibration::{PlattCalibrator, IsotonicCalibrator};
+pub use block_max_index::BlockMaxIndex;
 pub use metrics::{
     brier_score,
     calibration_report,

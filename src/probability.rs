@@ -33,6 +33,7 @@ pub struct BayesianProbabilityTransform {
     grad_beta_ema: f64,
     alpha_avg: f64,
     beta_avg: f64,
+    prior_fn: Option<Box<dyn Fn(f64, f64, f64) -> f64>>,
 }
 
 impl BayesianProbabilityTransform {
@@ -59,7 +60,22 @@ impl BayesianProbabilityTransform {
             grad_beta_ema: 0.0,
             alpha_avg: alpha,
             beta_avg: beta,
+            prior_fn: None,
         }
+    }
+
+    /// Create a new transform with a custom prior function.
+    ///
+    /// The prior_fn receives (score, tf, doc_len_ratio) and returns a prior probability.
+    pub fn with_prior_fn(
+        alpha: f64,
+        beta: f64,
+        base_rate: Option<f64>,
+        prior_fn: Box<dyn Fn(f64, f64, f64) -> f64>,
+    ) -> Self {
+        let mut s = Self::new(alpha, beta, base_rate);
+        s.prior_fn = Some(prior_fn);
+        s
     }
 
     /// EMA-averaged alpha for stable inference after online updates.
@@ -132,6 +148,8 @@ impl BayesianProbabilityTransform {
 
         let prior = if self.training_mode == TrainingMode::PriorFree {
             0.5
+        } else if let Some(ref pf) = self.prior_fn {
+            pf(score, tf, doc_len_ratio)
         } else {
             Self::composite_prior(tf, doc_len_ratio)
         };
@@ -333,4 +351,239 @@ fn compute_prior_aware_gradients(
         grad_beta += error * dp_dl * dl_dbeta;
     }
     (grad_alpha / n, grad_beta / n)
+}
+
+/// Compute weighted gradients for balanced/prior_free training mode.
+fn compute_weighted_balanced_gradients(
+    scores: &[f64],
+    labels: &[f64],
+    weights: &[f64],
+    alpha: f64,
+    beta: f64,
+    n: f64,
+) -> (f64, f64) {
+    let mut grad_alpha = 0.0;
+    let mut grad_beta = 0.0;
+    for (i, (&s, &y)) in scores.iter().zip(labels.iter()).enumerate() {
+        let l = safe_prob(sigmoid(alpha * (s - beta)));
+        let error = l - y;
+        grad_alpha += weights[i] * error * (s - beta);
+        grad_beta += weights[i] * error * (-alpha);
+    }
+    (grad_alpha / n, grad_beta / n)
+}
+
+/// Compute weighted gradients for prior_aware training mode.
+fn compute_weighted_prior_aware_gradients(
+    scores: &[f64],
+    labels: &[f64],
+    priors: &[f64],
+    weights: &[f64],
+    alpha: f64,
+    beta: f64,
+    n: f64,
+) -> (f64, f64) {
+    let mut grad_alpha = 0.0;
+    let mut grad_beta = 0.0;
+    for (i, (&s, &y)) in scores.iter().zip(labels.iter()).enumerate() {
+        let l = safe_prob(sigmoid(alpha * (s - beta)));
+        let p = priors[i];
+        let denom = l * p + (1.0 - l) * (1.0 - p);
+        let predicted = safe_prob(l * p / denom);
+
+        let dp_dl = p * (1.0 - p) / (denom * denom);
+        let dl_dalpha = l * (1.0 - l) * (s - beta);
+        let dl_dbeta = -l * (1.0 - l) * alpha;
+
+        let error = predicted - y;
+        grad_alpha += weights[i] * error * dp_dl * dl_dalpha;
+        grad_beta += weights[i] * error * dp_dl * dl_dbeta;
+    }
+    (grad_alpha / n, grad_beta / n)
+}
+
+/// Wraps a BayesianProbabilityTransform with temporal decay weighting.
+///
+/// Recent observations receive higher weight during fitting and updating,
+/// controlled by an exponential decay with configurable half-life.
+pub struct TemporalBayesianTransform {
+    pub transform: BayesianProbabilityTransform,
+    decay_half_life: f64,
+    decay_rate: f64,
+    timestamp: usize,
+}
+
+impl TemporalBayesianTransform {
+    pub fn new(alpha: f64, beta: f64, base_rate: Option<f64>, decay_half_life: f64) -> Self {
+        assert!(
+            decay_half_life > 0.0,
+            "decay_half_life must be > 0, got {}",
+            decay_half_life
+        );
+        let decay_rate = (2.0_f64).ln() / decay_half_life;
+        Self {
+            transform: BayesianProbabilityTransform::new(alpha, beta, base_rate),
+            decay_half_life,
+            decay_rate,
+            timestamp: 0,
+        }
+    }
+
+    /// Half-life of the temporal decay.
+    pub fn decay_half_life(&self) -> f64 {
+        self.decay_half_life
+    }
+
+    /// Current timestamp counter.
+    pub fn timestamp(&self) -> usize {
+        self.timestamp
+    }
+
+    /// Delegate to inner transform's likelihood.
+    pub fn likelihood(&self, score: f64) -> f64 {
+        self.transform.likelihood(score)
+    }
+
+    /// Delegate to inner transform's score_to_probability.
+    pub fn score_to_probability(&self, score: f64, tf: f64, doc_len_ratio: f64) -> f64 {
+        self.transform.score_to_probability(score, tf, doc_len_ratio)
+    }
+
+    /// Delegate to inner transform's wand_upper_bound.
+    pub fn wand_upper_bound(&self, bm25_upper_bound: f64, p_max: f64) -> f64 {
+        self.transform.wand_upper_bound(bm25_upper_bound, p_max)
+    }
+
+    /// Delegate to inner transform's averaged_alpha.
+    pub fn averaged_alpha(&self) -> f64 {
+        self.transform.averaged_alpha()
+    }
+
+    /// Delegate to inner transform's averaged_beta.
+    pub fn averaged_beta(&self) -> f64 {
+        self.transform.averaged_beta()
+    }
+
+    /// Batch gradient descent with temporal sample weighting.
+    ///
+    /// When timestamps are provided, each sample is weighted by
+    /// exp(-decay_rate * (max_ts - ts_i)), normalized so that weights sum to n.
+    pub fn fit(
+        &mut self,
+        scores: &[f64],
+        labels: &[f64],
+        timestamps: Option<&[usize]>,
+        learning_rate: f64,
+        max_iterations: usize,
+        tolerance: f64,
+        mode: TrainingMode,
+        tfs: Option<&[f64]>,
+        doc_len_ratios: Option<&[f64]>,
+    ) {
+        if mode == TrainingMode::PriorAware {
+            assert!(
+                tfs.is_some() && doc_len_ratios.is_some(),
+                "tfs and doc_len_ratios are required when mode is PriorAware"
+            );
+        }
+
+        let sample_weights: Option<Vec<f64>> = timestamps.map(|ts| {
+            let max_ts = *ts.iter().max().unwrap_or(&0) as f64;
+            let raw: Vec<f64> = ts
+                .iter()
+                .map(|&t| (-self.decay_rate * (max_ts - t as f64)).exp())
+                .collect();
+            let sum: f64 = raw.iter().sum();
+            let n = raw.len() as f64;
+            raw.iter().map(|&w| w * n / sum).collect()
+        });
+
+        let priors: Option<Vec<f64>> = if mode == TrainingMode::PriorAware {
+            let tfs = tfs.unwrap();
+            let dlrs = doc_len_ratios.unwrap();
+            Some(
+                tfs.iter()
+                    .zip(dlrs.iter())
+                    .map(|(&tf, &dlr)| BayesianProbabilityTransform::composite_prior(tf, dlr))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let mut alpha = self.transform.alpha;
+        let mut beta = self.transform.beta;
+        let n = scores.len() as f64;
+
+        for _ in 0..max_iterations {
+            let (grad_alpha, grad_beta) = match (&sample_weights, &priors) {
+                (Some(sw), Some(pr)) => {
+                    compute_weighted_prior_aware_gradients(scores, labels, pr, sw, alpha, beta, n)
+                }
+                (Some(sw), None) => {
+                    compute_weighted_balanced_gradients(scores, labels, sw, alpha, beta, n)
+                }
+                (None, Some(pr)) => {
+                    compute_prior_aware_gradients(scores, labels, pr, alpha, beta, n)
+                }
+                (None, None) => {
+                    compute_balanced_gradients(scores, labels, alpha, beta, n)
+                }
+            };
+
+            let new_alpha = alpha - learning_rate * grad_alpha;
+            let new_beta = beta - learning_rate * grad_beta;
+
+            if (new_alpha - alpha).abs() < tolerance && (new_beta - beta).abs() < tolerance {
+                alpha = new_alpha;
+                beta = new_beta;
+                break;
+            }
+
+            alpha = new_alpha;
+            beta = new_beta;
+        }
+
+        self.transform.alpha = alpha;
+        self.transform.beta = beta;
+        self.transform.training_mode = mode;
+        self.transform.n_updates = 0;
+        self.transform.grad_alpha_ema = 0.0;
+        self.transform.grad_beta_ema = 0.0;
+        self.transform.alpha_avg = alpha;
+        self.transform.beta_avg = beta;
+    }
+
+    /// Online SGD update with temporal decay applied to the averaging parameter.
+    ///
+    /// Increments the internal timestamp, computes an effective avg_decay that
+    /// ramps up with timestamp count, then delegates to the inner transform.
+    pub fn update(
+        &mut self,
+        scores: &[f64],
+        labels: &[f64],
+        learning_rate: f64,
+        momentum: f64,
+        decay_tau: f64,
+        max_grad_norm: f64,
+        avg_decay: f64,
+        mode: Option<TrainingMode>,
+        tfs: Option<&[f64]>,
+        doc_len_ratios: Option<&[f64]>,
+    ) {
+        self.timestamp += 1;
+        let effective_avg_decay = avg_decay * (1.0 - 1.0 / (1.0 + self.timestamp as f64));
+        self.transform.update(
+            scores,
+            labels,
+            learning_rate,
+            momentum,
+            decay_tau,
+            max_grad_norm,
+            effective_avg_decay,
+            mode,
+            tfs,
+            doc_len_ratios,
+        );
+    }
 }
