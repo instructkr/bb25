@@ -1,6 +1,6 @@
 [package]
 name = "bayesian_bm25"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Bayesian BM25 scoring and experimental validation (Rust core + Python bindings)"
 readme = "README.md"
